@@ -1,30 +1,78 @@
 
 import struct
 import os
+import zlib
 
 from pysteam.fs import DirectoryFolder, DirectoryFile, FilesystemPackage
 from math import ceil
 from zlib import adler32
 
-#try:
-from cStringIO import StringIO
-#except ImportError:
-    #from StringIO import StringIO
+# For Python 3 compatibility, use io.BytesIO instead of the removed cStringIO module.
+from io import BytesIO
 
-STEAM_TERMINATOR = "\\" # Hasta la vista, baby.
+try:  # Optional dependency for AES decryption
+    from Crypto.Cipher import AES  # type: ignore
+except Exception:  # pragma: no cover - handled at runtime
+    AES = None
 
+CACHE_CHECKSUM_LENGTH = 0x8000
+
+
+STEAM_TERMINATOR = "\\"  # Archive path separator
 MAX_FILENAME = 0
 
-def unpack_dword_list(stream, count):
-    return list(struct.unpack("<%dL" % count, stream.read(count*4)))
 
-def pack_dword_list(list):
-    return struct.pack("<%dL" % len(list), *list)
+def _normalize_key(key: bytes) -> bytes:
+    for size in (16, 24, 32):
+        if len(key) <= size:
+            return key.ljust(size, b"\x00")
+    return key[:32]
+
+
+def _decrypt_aes(data: bytes, key: bytes) -> bytes:
+    if AES is None:
+        raise ImportError("pycryptodome is required for encrypted GCF support")
+    key = _normalize_key(key)
+    pad = (-len(data)) % 16
+    cipher = AES.new(key, AES.MODE_CBC, b"\x00" * 16)
+    dec = cipher.decrypt(data + b"\x00" * pad)
+    if pad:
+        dec = dec[:-pad]
+    return dec
+
+
+def decrypt_gcf_data(data: bytes, key: bytes) -> bytes:
+    """Decrypt and decompress ``data`` from an encrypted GCF file."""
+    out = bytearray()
+    pos = 0
+    while pos < len(data):
+        chunk = data[pos : pos + CACHE_CHECKSUM_LENGTH]
+        if len(chunk) < 8:
+            break
+        comp_size, uncomp_size = struct.unpack_from("<ii", chunk, 0)
+        if (
+            uncomp_size > CACHE_CHECKSUM_LENGTH
+            or comp_size > uncomp_size
+            or uncomp_size < -1
+            or comp_size < -1
+        ):
+            dec = _decrypt_aes(chunk, key)
+            out.extend(dec)
+            pos += CACHE_CHECKSUM_LENGTH
+        else:
+            enc = chunk[: 8 + comp_size]
+            dec = _decrypt_aes(enc, key)
+            try:
+                out.extend(zlib.decompress(dec[8:8 + comp_size]))
+            except zlib.error:
+                out.extend(dec[8:8 + comp_size])
+            pos += 8 + comp_size
+    return bytes(out)
 
 def raise_parse_error(func):
     def internal(self, *args, **kwargs):
         if not self.is_parsed:
-            raise ValueError, "Cache file needs to be read first."
+            raise ValueError("Cache file needs to be read first.")
 
         return func(self, *args, **kwargs)
     return internal
@@ -32,18 +80,19 @@ def raise_parse_error(func):
 def raise_ncf_error(func):
     def internal(self, *args, **kwargs):
         if self.is_ncf():
-            raise ValueError, "NCF files do not have contents."
+            raise ValueError("NCF files do not have contents.")
 
         return func(self, *args, **kwargs)
     return internal
 
-class CacheFile(object):
+class CacheFile:
 
     # Constructor
     def __init__(self):
         self.is_parsed = False
         self.blocks = None
         self.alloc_table = None
+        self.block_entry_map = None
         self.manifest = None
         self.checksum_map = None
         self.data_header = None
@@ -80,6 +129,11 @@ class CacheFile(object):
             self.alloc_table.parse(stream)
             self.alloc_table.validate()
 
+            # Older GCF versions include an additional block entry map
+            if self.header.format_version < 6:
+                self.block_entry_map = CacheFileBlockEntryMap(self)
+                self.block_entry_map.parse(stream)
+
         # Manifest
         self.manifest = CacheFileManifest(self)
         self.manifest.parse(stream)
@@ -100,37 +154,84 @@ class CacheFile(object):
         self._read_directory()
         return self
 
-    ## def serialize(self):
+    def convert_version(self, target_version: int, out_path: str) -> None:
+        """Convert this cache file to a different GCF format version.
 
-    ##     stream = StringIO()
+        Parameters
+        ----------
+        target_version:
+            The format version to convert to (e.g. ``1`` or ``6``).
+        out_path:
+            Destination path for the converted archive.
 
-    ##     self.header.validate()
-    ##     stream.write(self.header.serialize())
+        Notes
+        -----
+        This is an initial implementation that rewrites the header and core
+        tables for ``target_version``.  Data blocks are copied verbatim.  Only
+        GCF archives are supported.
+        """
 
-    ##     if self.is_gcf():
+        if not self.is_parsed:
+            raise ValueError("Cache file needs to be read first.")
+        if not self.is_gcf():
+            raise ValueError("Only GCF archives can be converted")
+        if target_version not in (1, 3, 5, 6):
+            raise ValueError("Unsupported GCF version: %d" % target_version)
 
-    ##         self.blocks.validate()
-    ##         stream.write(self.blocks.serialize())
+        # Preserve original state so the in-memory representation remains
+        # unchanged after conversion.
+        original_version = self.header.format_version
+        original_block_entry_map = self.block_entry_map
+        original_map_entries = list(self.manifest.manifest_map_entries)
+        self.header.format_version = target_version
 
-    ##         self.alloc_table.validate()
-    ##         stream.write(self.alloc_table.serialize())
+        # Adjust mapping semantics based on the requested version.  Versions
+        # prior to 6 require a block entry map where manifest indices point to
+        # that map instead of direct block numbers.  Newer versions store block
+        # numbers directly and omit the block entry map entirely.
+        if target_version < 6:
+            if self.block_entry_map is None:
+                bemap = CacheFileBlockEntryMap(self)
+                bemap.block_count = self.blocks.block_count
+                bemap.entries = list(range(self.blocks.block_count))
+                self.block_entry_map = bemap
+            inverse = {blk: idx for idx, blk in enumerate(self.block_entry_map.entries)}
+            self.manifest.manifest_map_entries = [inverse.get(i, i) for i in original_map_entries]
+        else:
+            # Convert manifest map entries back to raw block indices and drop
+            # the block entry map from the output.
+            if self.block_entry_map is not None:
+                self.manifest.manifest_map_entries = [
+                    self.block_entry_map.entries[i] for i in original_map_entries
+                ]
+            self.block_entry_map = None
 
-    ##     self.manifest.validate()
-    ##     stream.write(self.manifest.serialize())
+        with open(out_path, "wb") as out:
+            out.write(self.header.serialize())
+            out.write(self.blocks.serialize())
+            out.write(self.alloc_table.serialize())
 
-    ##     self.checksum_map.validate()
-    ##     stream.write(self.checksum_map.serialize())
+            if target_version < 6 and self.block_entry_map is not None:
+                out.write(self.block_entry_map.serialize())
 
-    ##     if self.is_gcf():
+            # Manifest bytes were buffered during parsing so we can simply
+            # replay them.
+            out.write(self.manifest.header_data)
+            out.write(self.manifest.manifest_stream.getvalue())
 
-    ##         self.data_header.validate()
-    ##         stream.write(self.data_header.serialize())
+            out.write(self.checksum_map.serialize())
 
-    ##         stream.seek(self.data_header.first_sector_offset, os.SEEK_SET)
-    ##         for data in self.sector_data:
-    ##             stream.write(data)
+            if self.data_header is not None:
+                out.write(self.data_header.serialize())
 
-    ##     return stream
+                # Copy raw sector data directly from the original stream.
+                self.stream.seek(self.data_header.first_sector_offset)
+                out.write(self.stream.read())
+
+        # Restore original state in memory
+        self.header.format_version = original_version
+        self.block_entry_map = original_block_entry_map
+        self.manifest.manifest_map_entries = original_map_entries
 
 
     # Private Methods
@@ -241,12 +342,12 @@ class CacheFile(object):
 
     @raise_parse_error
     @raise_ncf_error
-    def _open_file(self, file, mode):
-        return GCFFileStream(file, self, mode)
+    def _open_file(self, file, mode, key=None):
+        return GCFFileStream(file, self, mode, key)
 
     @raise_parse_error
     @raise_ncf_error
-    def _extract_folder(self, folder, where, recursive, keep_folder_structure, item_filter=None):
+    def _extract_folder(self, folder, where, recursive, keep_folder_structure, item_filter=None, key=None):
 
         if keep_folder_structure:
             try:
@@ -258,23 +359,34 @@ class CacheFile(object):
         for entry in folder:
             # Don't bother recursing (and creating the folder) if no files are left after the filter.
             if entry.is_folder() and recursive and ((item_filter is None) or (len([x for x in entry.all_files() if item_filter(x)]) > 0)):
-                self._extract_folder(entry, where, True, keep_folder_structure, item_filter)
+                self._extract_folder(entry, where, True, keep_folder_structure, item_filter, key)
             elif entry.is_file():
                 if (item_filter is None) or item_filter(entry):
-                    self._extract_file(entry, where, keep_folder_structure)
+                    self._extract_file(entry, where, keep_folder_structure, key)
 
     @raise_parse_error
     @raise_ncf_error
-    def _extract_file(self, file, where, keep_folder_structure):
+    def _extract_file(self, file, where, keep_folder_structure, key=None):
         if keep_folder_structure:
-            fsHandle = open(os.path.join(where, file.sys_path()), "wb")
+            path = os.path.join(where, file.sys_path())
         else:
-            fsHandle = open(os.path.join(where, file.name), "wb")
-        cacheStream = self._open_file(file, "rb")
-        fsHandle.write(cacheStream.readall())
+            path = os.path.join(where, file.name)
 
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        if (
+            file._manifest_entry.directory_flags
+            & CacheFileManifestEntry.FLAG_IS_ENCRYPTED
+            and key is None
+        ):
+            raise ValueError("File is encrypted but no decryption key was provided")
+
+        cacheStream = self._open_file(file, "rb", key=key)
+        data = cacheStream.readall()
         cacheStream.close()
-        fsHandle.close()
+
+        with open(path, "wb") as fsHandle:
+            fsHandle.write(data)
 
     # Public Methods
     def is_ncf(self):
@@ -290,17 +402,24 @@ class CacheFile(object):
 
     @raise_parse_error
     @raise_ncf_error
-    def extract(self, where, recursive=True, keep_folder_structure=True, filter=None):
-        self._extract_folder(self.root, where, recursive, keep_folder_structure, filter)
+    def extract(self, where, recursive=True, keep_folder_structure=True, filter=None, key=None):
+        self._extract_folder(self.root, where, recursive, keep_folder_structure, filter, key)
 
     @raise_parse_error
     @raise_ncf_error
-    def extract_minimum_footprint(self, where, keep_folder_structure=True):
-        self._extract_folder(self.root, where, True, keep_folder_structure, lambda x:x.is_minimum_footprint and not (os.path.exists(os.path.join(where, x.sys_path())) and x.is_user_config))
+    def extract_minimum_footprint(self, where, keep_folder_structure=True, key=None):
+        self._extract_folder(
+            self.root,
+            where,
+            True,
+            keep_folder_structure,
+            lambda x: x.is_minimum_footprint and not (os.path.exists(os.path.join(where, x.sys_path())) and x.is_user_config),
+            key,
+        )
 
-    def open(self, filename, mode):
+    def open(self, filename, mode, key=None):
         # Use file.open instead of _open_file as we may be parsing an NCF
-        return self.root[filename].open(mode)
+        return self.root[filename].open(mode, key)
 
     def __len__(self):
         return len(self.root)
@@ -311,7 +430,45 @@ class CacheFile(object):
     def __getitem__(self, name):
         return self.root[name]
 
-class CacheFileHeader(object):
+    # ------------------------------------------------------------------
+    def is_fragmented(self) -> bool:
+        """Return ``True`` if any data blocks are marked as fragmented.
+
+        Only meaningful for GCF archives; NCF files do not store file data.
+        """
+
+        if not self.is_parsed or not self.is_gcf() or not self.blocks:
+            return False
+        return any(block.is_fragmented for block in self.blocks.blocks)
+
+    # ------------------------------------------------------------------
+    def validate(self):
+        """Validate file data and return a list of error strings.
+
+        Each file contained in the archive is read and the number of bytes
+        retrieved is compared against the size recorded in the manifest.  If
+        any errors are encountered or the sizes do not match, a descriptive
+        message is appended to the returned list.  An empty list indicates
+        the archive appears to be valid.
+        """
+
+        errors = []
+        if not self.is_parsed:
+            return ["Cache file not parsed"]
+
+        for entry in self.root.all_files():
+            try:
+                stream = entry.open("rb")
+                data = stream.readall()
+                stream.close()
+                if len(data) != entry.size():
+                    errors.append(f"{entry.path()}: size mismatch")
+            except Exception as exc:  # pragma: no cover - validation errors
+                errors.append(f"{entry.path()}: {exc}")
+
+        return errors
+
+class CacheFileHeader:
 
     def __init__(self, owner):
         self.owner = owner
@@ -331,7 +488,7 @@ class CacheFileHeader(object):
     def serialize(self):
         data = struct.pack("<10L", self.header_version, self.cache_type, self.format_version, self.application_id,
                            self.application_version, self.is_mounted, self.dummy1, self.file_size, self.sector_size, self.sector_count)
-        self.checksum = sum(ord(x) for x in data)
+        self.checksum = sum(data)
         return data + struct.pack("<L", self.checksum)
 
     def calculate_checksum(self):
@@ -341,22 +498,22 @@ class CacheFileHeader(object):
     def validate(self):
         # Check the usual stuff.
         if self.header_version != 1:
-            raise ValueError, "Invalid Cache File Header [HeaderVersion is not 1]"
+            raise ValueError("Invalid Cache File Header [HeaderVersion is not 1]")
         if not (self.is_ncf() or self.is_gcf()):
-            raise ValueError, "Invalid Cache File Header [Not GCF or NCF]"
+            raise ValueError("Invalid Cache File Header [Not GCF or NCF]")
         if self.is_ncf() and self.format_version != 1:
-            raise ValueError, "Invalid Cache File Header [Is NCF and version is not 1]"
-        elif self.is_gcf() and self.format_version != 6:
-            raise ValueError, "Invalid Cache File Header [Is GCF and version is not 6]"
+            raise ValueError("Invalid Cache File Header [Is NCF and version is not 1]")
+        elif self.is_gcf() and self.format_version not in (1, 3, 5, 6):
+            raise ValueError("Invalid Cache File Header [Is GCF and version is not 1, 3, 5, or 6]")
         # UPDATE: This fails on some files, namely the half-life files.
         #if self.is_mounted != 0:
         #   raise ValueError, "Invalid Cache File Header [Updating is not 0... WTF?]"
         if self.is_ncf() and self.file_size != 0:
-            raise ValueError, "Invalid Cache File Header [Is NCF and FileSize is not 0]"
+            raise ValueError("Invalid Cache File Header [Is NCF and FileSize is not 0]")
         if self.is_ncf() and self.sector_size != 0:
-            raise ValueError, "Invalid Cache File Header [Is NCF and BlockSize is not 0]"
+            raise ValueError("Invalid Cache File Header [Is NCF and BlockSize is not 0]")
         if self.is_ncf() and self.sector_count != 0:
-            raise ValueError, "Invalid Cache File Header [Is NCF and BlockCount is not 0]"
+            raise ValueError("Invalid Cache File Header [Is NCF and BlockCount is not 0]")
         #if self.checksum != self.calculate_checksum():
         #    raise ValueError, "Invalid Cache File Header [Checksums do not match]"
 
@@ -367,7 +524,7 @@ class CacheFileHeader(object):
     def get_blocks_length(self):
         return self.sector_size * self.sector_count + 32 # Block Size * Block Count + Block Header
 
-class CacheFileBlockAllocationTable(object):
+class CacheFileBlockAllocationTable:
 
     def __init__(self, owner):
         self.owner = owner
@@ -383,10 +540,10 @@ class CacheFileBlockAllocationTable(object):
          self.dummy2,
          self.dummy3,
          self.dummy4) = struct.unpack("<7L", stream.read(28))
-        self.checksum = sum(ord(x) for x in stream.read(4))
+        self.checksum = sum(stream.read(4))
 
         # Block Entries
-        for i in xrange(self.block_count):
+        for i in range(self.block_count):
             block = CacheFileBlockAllocationTableEntry(self)
             block.index = i
             block.parse(stream)
@@ -394,20 +551,20 @@ class CacheFileBlockAllocationTable(object):
 
     def serialize(self):
         data = struct.pack("<7L", self.block_count, self.blocks_used, self.last_block_used, self.dummy1, self.dummy2, self.dummy3, self.dummy4)
-        self.checksum = sum(ord(x) for x in data)
-        return data + struct.pack("<L", self.checksum) + "".join(x.serialize() for x in self.blocks)
+        self.checksum = sum(data)
+        return data + struct.pack("<L", self.checksum) + b"".join(x.serialize() for x in self.blocks)
 
     def calculate_checksum(self):
-        return sum(ord(x) for x in self.serialize()[:24])
+        return sum(self.serialize()[:24])
 
     def validate(self):
         if self.owner.header.sector_count != self.block_count:
-            raise ValueError, "Invalid Cache Block [Sector/BlockCounts do not match]"
+            raise ValueError("Invalid Cache Block [Sector/BlockCounts do not match]")
         #print self.checksum, self.calculate_checksum()
         #if self.checksum != self.calculate_checksum():
         #    raise ValueError, "Invalid Cache Block [Checksums do not match]"
 
-class CacheFileBlockAllocationTableEntry(object):
+class CacheFileBlockAllocationTableEntry:
 
     FLAG_DATA    = 0x200F8000
     FLAG_DATA_2  = 0x200FC000
@@ -477,7 +634,7 @@ class CacheFileBlockAllocationTableEntry(object):
     def serialize(self):
         return struct.pack("<2H6L", self.flags, self.dummy1, self.file_data_offset, self.file_data_size, self._first_sector_index, self._next_block_index, self._prev_block_index, self.manifest_index)
 
-class CacheFileAllocationTable(object):
+class CacheFileAllocationTable:
 
     def __init__(self, owner):
         self.owner = owner
@@ -493,7 +650,7 @@ class CacheFileAllocationTable(object):
         return len(self.entries)
 
     def __iter__(self):
-        return self.entries
+        return iter(self.entries)
 
     def parse(self, stream):
 
@@ -501,26 +658,44 @@ class CacheFileAllocationTable(object):
         (self.sector_count,
          self.first_unused_entry,
          self.is_long_terminator) = struct.unpack("<3L", stream.read(12))
-        self.checksum = sum(ord(x) for x in stream.read(4))
+        self.checksum = sum(stream.read(4))
 
         self.terminator = 0xFFFFFFFF if self.owner.alloc_table.is_long_terminator == 1 else 0xFFFF
         self.entries = unpack_dword_list(stream, self.sector_count)
 
     def serialize(self):
         data = struct.pack("<3L", self.sector_count, self.first_unused_entry, self.is_long_terminator)
-        self.checksum = sum(ord(x) for x in data)
+        self.checksum = sum(data)
         return data + struct.pack("<L", self.checksum) + pack_dword_list(self.entries)
 
     def calculate_checksum(self):
-        return sum(ord(x) for x in self.serialize()[:12])
+        return sum(self.serialize()[:12])
 
     def validate(self):
         if self.owner.header.sector_count != self.sector_count:
-            raise ValueError, "Invalid Cache Allocation Table [SectorCounts do not match]"
+            raise ValueError("Invalid Cache Allocation Table [SectorCounts do not match]")
         if self.checksum != self.calculate_checksum():
-            raise ValueError, "Invalid Cache Allocation Table [Checksums do not match]"
+            raise ValueError("Invalid Cache Allocation Table [Checksums do not match]")
 
-class CacheFileManifest(object):
+class CacheFileBlockEntryMap:
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.entries = []
+
+    def parse(self, stream):
+        # Header contains block count followed by a checksum field
+        (self.block_count,) = struct.unpack("<L", stream.read(4))
+        self.checksum = sum(stream.read(4))
+        self.entries = unpack_dword_list(stream, self.block_count)
+
+    def serialize(self):
+        data = struct.pack("<L", self.block_count)
+        self.checksum = sum(data)
+        return data + struct.pack("<L", self.checksum) + pack_dword_list(self.entries)
+
+
+class CacheFileManifest:
 
     FLAG_BUILD_MODE   = 0x00000001
     FLAG_IS_PURGE_ALL = 0x00000002
@@ -561,10 +736,10 @@ class CacheFileManifest(object):
          self.checksum) = struct.unpack("<14L", self.header_data)
 
         # 56 = size of header
-        self.manifest_stream = StringIO(stream.read(self.binary_size-56))
+        self.manifest_stream = BytesIO(stream.read(self.binary_size - 56))
 
         # Manifest Entries
-        for i in xrange(self.node_count):
+        for i in range(self.node_count):
             entry = CacheFileManifestEntry(self)
             entry.index = i
             # 28 = size of ManifestEntry
@@ -623,29 +798,29 @@ class CacheFileManifest(object):
         manifest_data.append(pack_dword_list(self.hash_table_keys))
         manifest_data.append(struct.pack("<2L", self.map_header_version, self.map_dummy1))
         manifest_data.append(pack_dword_list(self.manifest_map_entries))
-        manifest_data = "".join(manifest_data)
+        manifest_data = b"".join(manifest_data)
 
-        self.checksum = adler32(self.header_data + "\0\0\0\0\0\0\0\0" + manifest_data, 0)
+        self.checksum = adler32(self.header_data + b"\0\0\0\0\0\0\0\0" + manifest_data, 0)
         return self.header_data + struct.pack("<2L", self.fingerprint, self.checksum) + manifest_data
 
     def validate(self):
         if self.owner.header.application_id != self.application_id:
-            raise ValueError, "Invalid Cache File Manifest [Application ID mismatch]"
+            raise ValueError("Invalid Cache File Manifest [Application ID mismatch]")
         if self.owner.header.application_version != self.application_version:
-            raise ValueError, "Invalid Cache File Manifest [Application version mismatch]"
+            raise ValueError("Invalid Cache File Manifest [Application version mismatch]")
         #if self.checksum != self.calculate_checksum():
         #    raise ValueError, "Invalid Cache File Manifest [Checksum mismatch]"
         if self.map_header_version != 1:
-            raise ValueError, "Invalid Cache File Manifest [ManifestHeaderMap's HeaderVersion is not 1]"
+            raise ValueError("Invalid Cache File Manifest [ManifestHeaderMap's HeaderVersion is not 1]")
         if self.map_dummy1 != 0:
-            raise ValueError, "Invalid Cache File Manifest [ManifestHeaderMap's Dummy1 is not 0]"
+            raise ValueError("Invalid Cache File Manifest [ManifestHeaderMap's Dummy1 is not 0]")
 
     def calculate_checksum(self):
         # Blank out checksum and fingerprint + hack to get unsigned value.
         data = self.serialize()
-        return adler32(data[:48] + "\0\0\0\0\0\0\0\0" + data[56:], 0) & 0xffffffffL
+        return adler32(data[:48] + b"\0\0\0\0\0\0\0\0" + data[56:], 0) & 0xffffffff
 
-class CacheFileManifestEntry(object):
+class CacheFileManifestEntry:
 
     FLAG_IS_FILE        = 0x00004000
     FLAG_IS_EXECUTABLE  = 0x00000800
@@ -663,11 +838,15 @@ class CacheFileManifestEntry(object):
         self.owner = owner
 
     def _get_name(self):
-        return self.owner.filename_table[self.name_offset:].split("\0")[0]
+        raw = self.owner.filename_table[self.name_offset:].split(b"\0", 1)[0]
+        return raw.decode('utf-8', errors='replace')
 
     def _set_name(self, value):
-        name_end = self.owner.filename_table[self.name_offset:].find("\0")
-        self.owner.filename_table[self.name_offset:name_end] = value
+        value_bytes = value.encode('utf-8')
+        name_end = self.owner.filename_table[self.name_offset:].find(b"\0")
+        table = bytearray(self.owner.filename_table)
+        table[self.name_offset:self.name_offset + name_end] = value_bytes
+        self.owner.filename_table = bytes(table)
 
     def _get_block_iterator(self):
         block = self.first_block
@@ -676,12 +855,25 @@ class CacheFileManifestEntry(object):
             block = block.next_block
 
     def _get_first_block(self):
-        if len(self.owner.owner.blocks.blocks) == self.owner.manifest_map_entries[self.index]:
+        index = self.owner.manifest_map_entries[self.index]
+        # Older GCF versions store a block-entry-map indirection
+        if self.owner.owner.header.format_version < 6 and self.owner.owner.block_entry_map:
+            if index >= len(self.owner.owner.block_entry_map.entries):
+                return None
+            index = self.owner.owner.block_entry_map.entries[index]
+        if index >= len(self.owner.owner.blocks.blocks):
             return None
-        return self.owner.owner.blocks.blocks[self.owner.manifest_map_entries[self.index]]
+        return self.owner.owner.blocks.blocks[index]
 
     def _set_first_block(self, value):
-        self.owner.manifest_map_entries[self.index] = value
+        if self.owner.owner.header.format_version < 6 and self.owner.owner.block_entry_map:
+            try:
+                mapped = self.owner.owner.block_entry_map.entries.index(value)
+            except ValueError:
+                mapped = value
+            self.owner.manifest_map_entries[self.index] = mapped
+        else:
+            self.owner.manifest_map_entries[self.index] = value
 
     def parse(self, data):
         (self.name_offset,
@@ -699,7 +891,7 @@ class CacheFileManifestEntry(object):
     def serialize(self):
         return struct.pack("<7L", self.name_offset, self.item_size, self.checksum_index, self.directory_flags, self.parent_index, self.next_index, self.child_index)
 
-class CacheFileChecksumMap(object):
+class CacheFileChecksumMap:
 
     FLAG_IS_SIGNED      = 0x00000001
     FLAG_UNKNOWN        = 0xFFFFFFFE
@@ -722,7 +914,7 @@ class CacheFileChecksumMap(object):
          self.file_id_count,
          self.checksum_count) = struct.unpack("<6L", stream.read(24))
 
-        for i in xrange(self.file_id_count):
+        for i in range(self.file_id_count):
             self.entries.append(struct.unpack("<2L", stream.read(8)))
 
         self.checksums = unpack_dword_list(stream, self.checksum_count)
@@ -734,7 +926,7 @@ class CacheFileChecksumMap(object):
         data += [struct.pack("<2L", *i) for i in self.entries]
         data.append(pack_dword_list(self.checksums))
         data.append(self.signature)
-        return "".join(data)
+        return b"".join(data)
 
     def validate(self):
         pass
@@ -742,7 +934,7 @@ class CacheFileChecksumMap(object):
         # if self.owner.directory.file_count != self.item_count:
         #     raise ValueError, "Invalid Cache File Checksum Map [ItemCount and FileCount don't match]"
 
-class CacheFileSectorHeader(object):
+class CacheFileSectorHeader:
 
     def __init__(self, owner):
         self.owner = owner
@@ -758,22 +950,30 @@ class CacheFileSectorHeader(object):
 
     def serialize(self):
         self.checksum = self.calculate_checksum()
-        return struct.pack("<6L", self.sector_count, self.sector_size, self.first_sector_offset, self.sectors_used)
+        return struct.pack(
+            "<6L",
+            self.application_version,
+            self.sector_count,
+            self.sector_size,
+            self.first_sector_offset,
+            self.sectors_used,
+            self.checksum,
+        )
 
     def validate(self):
         if self.application_version != self.owner.header.application_version:
-            raise ValueError, "Invalid Cache File Sector Header [ApplicationVersion mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [ApplicationVersion mismatch]")
         if self.sector_count != self.owner.header.sector_count:
-            raise ValueError, "Invalid Cache File Sector Header [SectorCount mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [SectorCount mismatch]")
         if self.sector_size != self.owner.header.sector_size:
-            raise ValueError, "Invalid Cache File Sector Header [SectorSize mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [SectorSize mismatch]")
         if self.checksum != self.calculate_checksum():
-            raise ValueError, "Invalid Cache File Sector Header [Checksum mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [Checksum mismatch]")
 
     def calculate_checksum(self):
         return self.sector_count + self.sector_size + self.first_sector_offset + self.sectors_used
 
-class CacheFileSector(object):
+class CacheFileSector:
 
     def __init__(self, owner, index):
         self.owner = owner
@@ -796,21 +996,27 @@ class CacheFileSector(object):
 
     next_sector = property(_get_next_sector, _set_next_sector)
 
-class GCFFileStream(object):
+class GCFFileStream:
 
-    def __init__(self, entry, owner, mode):
+    def __init__(self, entry, owner, mode, key=None):
         self.entry = entry
         self.owner = owner
         self.mode = mode
-        self.sectors = [sect.get_data() for sect in self.entry.sectors]
+        self.key = key
 
+        sector_size = self.owner.data_header.sector_size
+        raw = b"".join(sect.get_data() for sect in self.entry.sectors)
+        if key:
+            raw = decrypt_gcf_data(raw, key)
+
+        self.sectors = [raw[i : i + sector_size] for i in range(0, len(raw), sector_size)]
         self.position = 0
 
     # Iterator protocol.
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         return self.readline()
 
     # File protocol.
@@ -828,7 +1034,7 @@ class GCFFileStream(object):
     def seek(self, offset, origin=None):
 
         def err():
-            raise IOError, "Attempting to seek past end of file"
+            raise IOError("Attempting to seek past end of file")
 
         if origin == os.SEEK_SET or origin is None:
             if offset > self.entry.item_size:
@@ -852,22 +1058,21 @@ class GCFFileStream(object):
 
         # Our count for the size parameter.
         count = 0
-        # Strings are immutable... use a list
+        # Bytes are immutable... use a list
         chars = []
 
-        lastchar = ""
+        lastchar = b""
 
-        # Loop over our data one character at a time
-        # looking for line breaks
+        # Loop over our data one byte at a time looking for line breaks
         while True:
             lastchar = self.read(1)
             # If we get a CR
-            if lastchar == "\r":
+            if lastchar == b"\r":
                 # Strip out a LF if it comes next
-                if self.read(1) != "\n":
+                if self.read(1) != b"\n":
                     self.position -= 1
                 break
-            elif lastchar == "\n":
+            elif lastchar == b"\n":
                 break
             elif count > size and size > 0:
                 # FIXME: What does the file module do when we have a size
@@ -878,7 +1083,10 @@ class GCFFileStream(object):
             # Characters
             chars.append(lastchar)
 
-        return "".join(chars)
+        line = b"".join(chars)
+        if self.is_text_mode():
+            return line.decode('utf-8', errors='replace')
+        return line
 
     def readlines(self, sizehint=-1):
 
@@ -899,23 +1107,23 @@ class GCFFileStream(object):
     def read(self, size=0):
 
         if not self.is_read_mode():
-            raise AttributeError, "Cannot read from file with current mode"
+            raise AttributeError("Cannot read from file with current mode")
 
         sector_size = self.owner.data_header.sector_size
         sector_index, offset = divmod(self.position, sector_size)
 
         if not self.sectors:
-            return ""
+            return b""
 
         # Raise an error if we read past end of file.
         if self.position + size > self.entry.item_size:
-            raise IOError, "Attempting to read past end of file"
+            raise IOError("Attempting to read past end of file")
 
         # One file isn't always in just one block.
         # We have to read multiple blocks sometimes in order to get a file.
         read_pos = 0
 
-        # Strings are immutable... use a list.
+        # Bytes are immutable... use a list.
         data = []
 
         if size < 1:
@@ -943,12 +1151,11 @@ class GCFFileStream(object):
             read_pos += size
 
         # TYPE CHANGE!
-        # Data - from list to str.
-        data = "".join(data)
+        # Data - from list to bytes.
+        data = b"".join(data)
 
-        # Text mode; strip all \r's
         if self.is_text_mode():
-            data = data.replace("\r", "")
+            return data.decode('utf-8', errors='replace').replace("\r", "")
 
         return data
 
