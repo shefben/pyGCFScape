@@ -47,7 +47,7 @@ class DirectoryFolder:
         return len(self.items)
 
     def size(self):
-        return sum(i.size() for i in self.items)
+        return sum(i.size() for i in self.items.values())
 
     def extract(self, where, recursive=False, keep_folder_structure=True, filter=None, key=None):
         return self.package._extract_folder(self, where, recursive, keep_folder_structure, filter, key)
