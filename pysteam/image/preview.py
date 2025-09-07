@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 
@@ -29,10 +29,10 @@ class ImageViewWidget(QWidget):
 
     # ------------------------------------------------------------------
     def load_image(self, data: bytes) -> None:
-        image = QImage.fromData(data)
-        if image.isNull():
+        pix = QPixmap()
+        if not pix.loadFromData(data):
             self.label.setText("Unsupported image format")
             self.label.setPixmap(QPixmap())
             return
-        self.label.setPixmap(QPixmap.fromImage(image))
-        self.label.setToolTip(f"{image.width()}x{image.height()} image")
+        self.label.setPixmap(pix)
+        self.label.setToolTip(f"{pix.width()}x{pix.height()} image")

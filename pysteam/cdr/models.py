@@ -1,5 +1,4 @@
 
-import datetime
 import struct
 from pysteam.util import py_time, bytes_as_bool
 from pysteam.blob import Blob
