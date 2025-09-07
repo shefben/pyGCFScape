@@ -17,7 +17,12 @@ from typing import Tuple
 
 from PyQt5.QtCore import QPointF, Qt
 from PyQt5.QtGui import QPainter, QPixmap
-from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import (
+    QGraphicsScene,
+    QGraphicsView,
+    QVBoxLayout,
+    QWidget,
+)
 
 from . import detect_engine
 
@@ -30,14 +35,14 @@ class MDLViewWidget(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.label = QLabel("No preview")
-        self.label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.label)
+        self.view = _ZoomView()
+        self.scene = QGraphicsScene(self)
+        self.view.setScene(self.scene)
+        layout.addWidget(self.view)
 
     # ------------------------------------------------------------------
     def clear(self) -> None:
-        self.label.setText("No preview")
-        self.label.setPixmap(QPixmap())
+        self.scene.clear()
 
     # ------------------------------------------------------------------
     def load_model(self, data: bytes) -> None:
@@ -50,13 +55,14 @@ class MDLViewWidget(QWidget):
         elif engine == "Source":
             bbox = self._source_bounds(data)
         if bbox is None:
-            self.label.setText("Unsupported MDL")
+            self.scene.clear()
+            self.scene.addText("Unsupported MDL")
             return
-        self.label.setToolTip(f"{engine} model")
+        self.view.setToolTip(f"{engine} model")
         (min_x, min_y, min_z), (max_x, max_y, max_z) = bbox
         width = max_x - min_x or 1.0
         height = max_z - min_z or 1.0
-        pixmap = QPixmap(self.width() or 300, self.height() or 300)
+        pixmap = QPixmap(300, 300)
         pixmap.fill(Qt.black)
         painter = QPainter(pixmap)
         painter.setPen(Qt.white)
@@ -72,7 +78,33 @@ class MDLViewWidget(QWidget):
         for i in range(len(pts)):
             painter.drawLine(pts[i], pts[(i + 1) % len(pts)])
         painter.end()
-        self.label.setPixmap(pixmap)
+        self.scene.clear()
+        self.scene.addPixmap(pixmap)
+        self.view.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+
+
+class _ZoomView(QGraphicsView):
+    def __init__(self):
+        super().__init__()
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+
+    def wheelEvent(self, event):
+        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+        self.scale(factor, factor)
+
+    def keyPressEvent(self, event):
+        step = 20
+        if event.key() == Qt.Key_Left:
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - step)
+        elif event.key() == Qt.Key_Right:
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + step)
+        elif event.key() == Qt.Key_Up:
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - step)
+        elif event.key() == Qt.Key_Down:
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() + step)
+        else:
+            super().keyPressEvent(event)
 
     # ------------------------------------------------------------------
     def _goldsrc_bounds(self, data: bytes) -> Tuple[Vector, Vector] | None:

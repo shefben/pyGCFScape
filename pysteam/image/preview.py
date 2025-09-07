@@ -1,9 +1,16 @@
 """Generic image preview widget using Qt's image plugins."""
 from __future__ import annotations
 
+from io import BytesIO
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
+
+try:  # pragma: no cover - optional dependency
+    from PIL import Image
+except Exception:  # pragma: no cover - gracefully handle missing pillow
+    Image = None  # type: ignore
 
 
 class ImageViewWidget(QWidget):
@@ -30,7 +37,15 @@ class ImageViewWidget(QWidget):
     # ------------------------------------------------------------------
     def load_image(self, data: bytes) -> None:
         pix = QPixmap()
-        if not pix.loadFromData(data):
+        if not pix.loadFromData(data) and Image is not None:
+            try:
+                img = Image.open(BytesIO(data))
+                buf = BytesIO()
+                img.save(buf, format="PNG")
+                pix.loadFromData(buf.getvalue(), "PNG")
+            except Exception:
+                pix = QPixmap()
+        if pix.isNull():
             self.label.setText("Unsupported image format")
             self.label.setPixmap(QPixmap())
             return
