@@ -7,7 +7,7 @@ from pysteam.blob import Blob
 class ParseError(Exception):
     pass
 
-class CDR(object):
+class CDR:
     CURRENT_VER = 10
 
     def parse(self, stream):
@@ -41,7 +41,7 @@ class CDR(object):
 ### Application
 ################################
 
-class Application(object):
+class Application:
     def __str__(self):
         return "%s (App ID %d): %s" % ("Cache File" if self.is_cache() else "Application", self.app_id, self.app_name)
 
@@ -106,15 +106,15 @@ class Application(object):
             tempblob.parse(n)
             self.user_defined_records.append(tempblob)
 
-class ApplicationLaunchOptionRecord(object):
+class ApplicationLaunchOptionRecord:
     def __str__(self):
-        return "%s's Launch Option Record %d" % (unicode(self.owner), self.option_id)
+        return "%s's Launch Option Record %d" % (str(self.owner), self.option_id)
 
     def parse(self, node):
 
         blob = node.child
         if len(blob.children) == 0:
-            raise ValueError, "Blob has no children"
+            raise ValueError("Blob has no children")
         self.option_id = struct.unpack("<l", node.key)[0]
 
         self.description = node[1].data
@@ -124,9 +124,9 @@ class ApplicationLaunchOptionRecord(object):
         self.no_start_menu_shortcut = bytes_as_bool(node[5].data)
         self.long_running_unattended = bytes_as_bool(node[6].data)
 
-class ApplicationVersionRecord(object):
+class ApplicationVersionRecord:
     def __str__(self):
-        return "%s's Version Record %d" % (unicode(self.owner), self.version_id)
+        return "%s's Version Record %d" % (str(self.owner), self.version_id)
 
     def parse(self, node):
         self.version_id = struct.unpack("<l", node.key)[0]
@@ -146,14 +146,14 @@ class ApplicationVersionRecord(object):
             tempblob.owner = self
             tempblob.parse(n)
 
-class ApplicationVersionLaunchRecord(object):
+class ApplicationVersionLaunchRecord:
     def __str__(self):
         return "%s: Version %d's Launch Record %d" % (self.owner.owner, self.owner.version_id, self.launch_option_id)
 
     def parse(self, node):
         self.launch_option_id = struct.unpack("<l", node.key)[0]
 
-class ApplicationFilesystemRecord(object):
+class ApplicationFilesystemRecord:
     def get_mount_name(self):
         if len(self.mount_name) > 0:
             return self.mount_name
@@ -161,16 +161,16 @@ class ApplicationFilesystemRecord(object):
             return Application.objects.get(app_id=self.app_id).get_mount_name()
 
     def __str__(self):
-        return "%s: Cache import: %s" % (unicode(self.owner), self.get_mount_name())
+        return "%s: Cache import: %s" % (str(self.owner), self.get_mount_name())
 
     def parse(self, node):
         self.app_id = struct.unpack("<l", node[1].data)[0]
         self.mount_name = node[2].data
         self.is_optional = bytes_as_bool(node[3].data)
 
-class ApplicationUserDefinedRecord(object):
+class ApplicationUserDefinedRecord:
     def __str__(self):
-        return "%s: User Defined Record" % unicode(self.owner)
+        return "%s: User Defined Record" % str(self.owner)
 
     def parse(self, node):
         self.key = node.key
