@@ -59,7 +59,10 @@ class BSPViewWidget(QWidget):
         try:
             bsp = bsp_tool.load_bsp(tmp_path)
         finally:
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except PermissionError:
+                pass
 
         # Gather geometry as a list of polygons, each polygon being a sequence
         # of ``(x, y)`` tuples.  The logic mirrors the approach used by both

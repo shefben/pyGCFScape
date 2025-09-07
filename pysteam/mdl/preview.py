@@ -92,6 +92,12 @@ class MDLViewWidget(QWidget):
         # Offsets taken from ``studiohdr_t`` in the Source SDK.
         if len(data) < 152:
             return None
-        bbmin = struct.unpack_from("<3f", data, 128)
-        bbmax = struct.unpack_from("<3f", data, 140)
-        return bbmin, bbmax
+
+        view_bbmin = struct.unpack_from("<3f", data, 128)
+        view_bbmax = struct.unpack_from("<3f", data, 140)
+        if any(view_bbmin) or any(view_bbmax):
+            return view_bbmin, view_bbmax
+
+        hull_min = struct.unpack_from("<3f", data, 104)
+        hull_max = struct.unpack_from("<3f", data, 116)
+        return hull_min, hull_max
