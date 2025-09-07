@@ -12,6 +12,7 @@ import os
 import tempfile
 from typing import List, Sequence, Tuple
 
+from PyQt5.QtGui import QVector3D
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from . import detect_engine
@@ -135,7 +136,11 @@ class BSPViewWidget(QWidget):
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
         min_z, max_z = min(zs), max(zs)
-        center = [(min_x + max_x) / 2, (min_y + max_y) / 2, (min_z + max_z) / 2]
+        center = QVector3D(
+            (min_x + max_x) / 2,
+            (min_y + max_y) / 2,
+            (min_z + max_z) / 2,
+        )
         size = max(max_x - min_x, max_y - min_y, max_z - min_z) or 1.0
 
         self.view.opts["center"] = center

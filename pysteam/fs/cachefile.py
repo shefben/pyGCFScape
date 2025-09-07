@@ -203,14 +203,18 @@ class CacheFile:
         self.manifest.validate()
 
         # Checksum Map
-        self.checksum_map = CacheFileChecksumMap(self)
-        self.checksum_map.parse(stream)
-        self.checksum_map.validate()
+        if self.header.format_version > 1:
+            self.checksum_map = CacheFileChecksumMap(self)
+            self.checksum_map.parse(stream)
+            self.checksum_map.validate()
+        else:
+            self.checksum_map = None
 
         if self.is_gcf():
             # Data Header.
             self.data_header = CacheFileSectorHeader(self)
-            self.data_header.parse(stream.read(24)) # size of BlockDataHeader (6 longs)
+            header_size = 24 if self.header.format_version > 3 else 20
+            self.data_header.parse(stream.read(header_size), self.header.format_version)
             self.data_header.validate()
 
         self.is_parsed = True
@@ -314,7 +318,8 @@ class CacheFile:
 
             out.write(manifest.serialize())
 
-            out.write(self.checksum_map.serialize())
+            if self.checksum_map is not None:
+                out.write(self.checksum_map.serialize())
 
             if self.data_header is not None:
                 out.write(self.data_header.serialize())
@@ -407,7 +412,8 @@ class CacheFile:
                 out.write(self.block_entry_map.serialize())
             out.write(self.manifest.header_data)
             out.write(self.manifest.manifest_stream.getvalue())
-            out.write(self.checksum_map.serialize())
+            if self.checksum_map is not None:
+                out.write(self.checksum_map.serialize())
 
             self.data_header.first_sector_offset = out.tell() + 24
             out.write(self.data_header.serialize())
@@ -655,8 +661,11 @@ class CacheFile:
         ):
             return None  # Can't validate encrypted data, assume OK.
 
-        if manifest_entry.checksum_index == 0xFFFFFFFF:
-            return None  # No checksum to validate against.
+        if (
+            self.checksum_map is None
+            or manifest_entry.checksum_index == 0xFFFFFFFF
+        ):
+            return None  # No checksum information available.
 
         try:
             count, first = self.checksum_map.entries[manifest_entry.checksum_index]
@@ -1236,18 +1245,41 @@ class CacheFileSectorHeader:
 
     def __init__(self, owner):
         self.owner = owner
+        self.format_version = owner.header.format_version
 
-    def parse(self, data):
-        (self.application_version,
-         self.sector_count,
-         self.sector_size,
-         self.first_sector_offset,
-         self.sectors_used,
-         self.checksum) = struct.unpack("<6L", data)
-
+    def parse(self, data, format_version):
+        self.format_version = format_version
+        if format_version <= 3:
+            (
+                self.sector_count,
+                self.sector_size,
+                self.first_sector_offset,
+                self.sectors_used,
+                self.checksum,
+            ) = struct.unpack("<5L", data)
+            # Older GCF versions omit the application version field.
+            self.application_version = self.owner.header.application_version
+        else:
+            (
+                self.application_version,
+                self.sector_count,
+                self.sector_size,
+                self.first_sector_offset,
+                self.sectors_used,
+                self.checksum,
+            ) = struct.unpack("<6L", data)
 
     def serialize(self):
         self.checksum = self.calculate_checksum()
+        if self.format_version <= 3:
+            return struct.pack(
+                "<5L",
+                self.sector_count,
+                self.sector_size,
+                self.first_sector_offset,
+                self.sectors_used,
+                self.checksum,
+            )
         return struct.pack(
             "<6L",
             self.application_version,
@@ -1259,14 +1291,25 @@ class CacheFileSectorHeader:
         )
 
     def validate(self):
-        if self.application_version != self.owner.header.application_version:
-            raise ValueError("Invalid Cache File Sector Header [ApplicationVersion mismatch]")
+        if (
+            self.format_version > 3
+            and self.application_version != self.owner.header.application_version
+        ):
+            raise ValueError(
+                "Invalid Cache File Sector Header [ApplicationVersion mismatch]"
+            )
         if self.sector_count != self.owner.header.sector_count:
-            raise ValueError("Invalid Cache File Sector Header [SectorCount mismatch]")
+            raise ValueError(
+                "Invalid Cache File Sector Header [SectorCount mismatch]"
+            )
         if self.sector_size != self.owner.header.sector_size:
-            raise ValueError("Invalid Cache File Sector Header [SectorSize mismatch]")
+            raise ValueError(
+                "Invalid Cache File Sector Header [SectorSize mismatch]"
+            )
         if self.checksum != self.calculate_checksum():
-            raise ValueError("Invalid Cache File Sector Header [Checksum mismatch]")
+            raise ValueError(
+                "Invalid Cache File Sector Header [Checksum mismatch]"
+            )
 
     def calculate_checksum(self):
         return self.sector_count + self.sector_size + self.first_sector_offset + self.sectors_used
