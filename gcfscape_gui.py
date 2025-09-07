@@ -64,6 +64,7 @@ from PyQt5.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QTextEdit,
     QToolBar,
@@ -77,6 +78,7 @@ from PyQt5.QtWidgets import (
 # The pysteam cache file parser is used to read GCF/NCF archives.  It
 # exposes a similar API to the original C++ version used by GCFScape.
 from pysteam.fs.cachefile import CacheFile
+from pysteam.bsp.preview import BSPViewWidget
 
 
 # ---------------------------------------------------------------------------
@@ -225,23 +227,41 @@ class PreviewWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        self.viewer = QTextEdit()
-        self.viewer.setReadOnly(True)
-        layout.addWidget(self.viewer)
+        self.stack = QStackedWidget()
+        self.text_view = QTextEdit()
+        self.text_view.setReadOnly(True)
+        self.bsp_view = BSPViewWidget()
+        self.stack.addWidget(self.text_view)
+        self.stack.addWidget(self.bsp_view)
+        layout.addWidget(self.stack)
 
     # ------------------------------------------------------------------
     def clear(self) -> None:
-        self.viewer.clear()
+        self.text_view.clear()
+        self.bsp_view.clear()
+        self.stack.setCurrentWidget(self.text_view)
 
     # ------------------------------------------------------------------
-    def set_content(self, data: bytes) -> None:
-        """Attempt to display ``data`` as UTF-8, fall back to hex dump."""
+    def set_entry(self, entry) -> None:
+        """Display a preview for ``entry`` which may be a BSP or text file."""
 
+        name = entry.name.lower()
         try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            text = " ".join(f"{b:02x}" for b in data)
-        self.viewer.setPlainText(text)
+            data = entry.read()
+        except Exception:
+            self.clear()
+            return
+
+        if name.endswith(".bsp"):
+            self.bsp_view.load_map(data)
+            self.stack.setCurrentWidget(self.bsp_view)
+        else:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = " ".join(f"{b:02x}" for b in data)
+            self.text_view.setPlainText(text)
+            self.stack.setCurrentWidget(self.text_view)
 
 
 # ---------------------------------------------------------------------------
@@ -588,14 +608,8 @@ class GCFScapeWindow(QMainWindow):
             self.preview.clear()
             return
 
-        try:
-            data = entry.read()
-        except Exception:
-            self.preview.clear()
-            return
-
-        self.preview.set_content(data)
-
+        self.preview.set_entry(entry)
+        
     # ------------------------------------------------------------------
     # Context menu and actions
     # ------------------------------------------------------------------
