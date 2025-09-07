@@ -62,6 +62,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QProgressDialog,
+    QPlainTextEdit,
     QSplitter,
     QStackedWidget,
     QStatusBar,
@@ -128,7 +129,7 @@ class EntryItem(QTreeWidgetItem):
             stream = None
             try:
                 stream = self.entry.open("rb")
-                data = stream.readall()
+                data = stream.read(self.entry.size())
                 pix = QPixmap()
                 if pix.loadFromData(data):
                     icon = QIcon(pix)
@@ -260,7 +261,7 @@ class PropertiesDialog(QDialog):
             stream = None
             try:
                 stream = entry.open("rb")
-                data = stream.readall()
+                data = stream.read(entry.size())
                 pix = QPixmap()
                 if pix.loadFromData(data):
                     icon = QIcon(pix)
@@ -491,7 +492,7 @@ class PreviewWidget(QWidget):
 
         try:
             stream = entry.open("rb", key=key)
-            data = stream.readall()
+            data = stream.read(entry.size())
         except Exception:
             self.clear()
             return
@@ -591,7 +592,6 @@ class GCFScapeWindow(QMainWindow):
         self.tree.itemSelectionChanged.connect(self._update_preview)
         left_layout.addWidget(self.tree)
 
-        right_splitter = QSplitter(Qt.Vertical)
         self.file_list = QTreeWidget()
         self.file_list.setHeaderLabels(["Name", "Size", "Type"])
         self.file_list.setRootIsDecorated(False)
@@ -605,20 +605,26 @@ class GCFScapeWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        right_splitter.addWidget(self.file_list)
-
-        self.preview = PreviewWidget()
-        right_splitter.addWidget(self.preview)
-        right_splitter.setStretchFactor(0, 3)
-        right_splitter.setStretchFactor(1, 1)
-        show_preview = self.settings.value("preview", True, bool)
-        self.preview.setVisible(show_preview)
 
         splitter.addWidget(left_widget)
-        splitter.addWidget(right_splitter)
+        splitter.addWidget(self.file_list)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
-        self.setCentralWidget(splitter)
+
+        main_splitter = QSplitter(Qt.Vertical)
+        main_splitter.addWidget(splitter)
+        self.console = QPlainTextEdit()
+        self.console.setReadOnly(True)
+        main_splitter.addWidget(self.console)
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 0)
+        self.setCentralWidget(main_splitter)
+
+        self.preview_widget = PreviewWidget()
+        self.preview_dialog = QDialog(self)
+        layout = QVBoxLayout(self.preview_dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.preview_widget)
 
         # ------------------------------------------------------------------
         # Status bar
@@ -655,8 +661,6 @@ class GCFScapeWindow(QMainWindow):
         self.properties_action = QAction("Properties", self)
         self.properties_action.triggered.connect(lambda: self._show_properties(self._current_entry()))
 
-        self.preview_toggle_action = QAction("Show Preview", self, checkable=True, checked=show_preview)
-        self.preview_toggle_action.toggled.connect(lambda checked: (self.preview.setVisible(checked), self.settings.setValue("preview", checked)))
 
         self.find_action = QAction("&Find…", self)
         self.find_action.triggered.connect(self._open_search_dialog)
@@ -706,7 +710,6 @@ class GCFScapeWindow(QMainWindow):
         view_menu = menubar.addMenu("&View")
         view_menu.addAction(self.expand_action)
         view_menu.addAction(self.collapse_action)
-        view_menu.addAction(self.preview_toggle_action)
 
         tools_menu = menubar.addMenu("&Tools")
         tools_menu.addAction(self.defrag_action)
@@ -740,6 +743,11 @@ class GCFScapeWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Utility methods
     # ------------------------------------------------------------------
+
+    def _log(self, message: str) -> None:
+        """Append ``message`` to the console output pane."""
+
+        self.console.appendPlainText(message)
 
     def _current_entry(self):
         """Return the entry associated with the current selection."""
@@ -829,7 +837,8 @@ class GCFScapeWindow(QMainWindow):
         self.current_path = None
         self.tree.clear()
         self.file_list.clear()
-        self.preview.clear()
+        self.preview_widget.clear()
+        self.preview_dialog.hide()
         self.statusBar().clearMessage()
         self.entry_to_tree_item.clear()
 
@@ -882,7 +891,8 @@ class GCFScapeWindow(QMainWindow):
             return
         for name, entry in sorted(folder.items.items()):
             self.file_list.addTopLevelItem(EntryItem(entry))
-        self.preview.clear()
+        self.preview_widget.clear()
+        self.preview_dialog.hide()
         self.statusBar().showMessage(
             f"{_entry_location(folder)} ({len(folder.items)} items)"
         )
@@ -925,10 +935,17 @@ class GCFScapeWindow(QMainWindow):
         if not entry:
             entry = self._current_entry()
         if not entry or entry.is_folder():
-            self.preview.clear()
+            self.preview_widget.clear()
+            self.preview_dialog.hide()
             return
 
-        self.preview.set_entry(entry)
+        try:
+            self.preview_widget.set_entry(entry)
+            self.preview_dialog.show()
+        except Exception as exc:
+            self.preview_widget.clear()
+            self.preview_dialog.hide()
+            self._log(f"Preview error for {entry.path()}: {exc}")
         self.statusBar().showMessage(_entry_location(entry))
 
     # ------------------------------------------------------------------
@@ -998,16 +1015,17 @@ class GCFScapeWindow(QMainWindow):
         progress = QProgressDialog("Extracting…", "Cancel", 0, 100, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.canceled.connect(worker.cancel)
-
         worker.progress.connect(lambda val, text: (progress.setValue(val), progress.setLabelText(text)))
-        worker.error.connect(lambda msg: QMessageBox.critical(self, "Error", msg))
+        worker.error.connect(lambda msg: (self._log(f"Error: {msg}"), QMessageBox.critical(self, "Error", msg)))
         worker.finished.connect(progress.close)
 
+        self._log(f"Extracting {len(files)} file(s) to {dest}")
         worker.start()
         progress.exec()
 
         if not worker.isRunning():
             QMessageBox.information(self, "Extraction complete", f"Extracted to {dest}")
+            self._log(f"Extraction complete: {dest}")
 
     # ------------------------------------------------------------------
     def _copy_text(self, text: str) -> None:
@@ -1038,13 +1056,23 @@ class GCFScapeWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Save Defragmented GCF", default, "GCF Files (*.gcf)")
         if not path:
             return
+
+        progress = QProgressDialog("Defragmenting…", None, 0, 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        QApplication.processEvents()
         try:
+            self._log(f"Defragmenting to {path}")
             self.cachefile.defragment(path)
         except Exception as exc:  # pragma: no cover - GUI feedback
             traceback.print_exc()
             QMessageBox.critical(self, "Defragment", str(exc))
+            self._log(f"Defragment error: {exc}")
+            progress.close()
             return
+        progress.close()
         QMessageBox.information(self, "Defragment", f"Defragmented archive written to {path}")
+        self._log(f"Defragment complete: {path}")
 
     # ------------------------------------------------------------------
     def _validate(self) -> None:
@@ -1053,7 +1081,17 @@ class GCFScapeWindow(QMainWindow):
         if not self.cachefile:
             return
 
-        errors = self.cachefile.validate()
+        files = list(self.cachefile.root.all_files())
+        progress = QProgressDialog("Validating…", None, 0, len(files), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        def cb(i, total):
+            progress.setValue(i)
+            QApplication.processEvents()
+
+        errors = self.cachefile.validate(progress=cb)
+        progress.close()
         if errors:
             text = "\n".join(errors[:20])
             QMessageBox.warning(
@@ -1061,12 +1099,14 @@ class GCFScapeWindow(QMainWindow):
                 "Validate",
                 f"Problems were detected in the archive:\n{text}",
             )
+            self._log(f"Validation errors:\n{text}")
         else:
             QMessageBox.information(
                 self,
                 "Validate",
                 "Archive appears to be valid.",
             )
+            self._log("Validation complete: no errors found")
 
     # ------------------------------------------------------------------
     def _convert_gcf(self, target_version: int) -> None:
@@ -1080,19 +1120,30 @@ class GCFScapeWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Save Converted GCF", default, "GCF Files (*.gcf)")
         if not path:
             return
+
+        progress = QProgressDialog("Converting…", None, 0, 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        QApplication.processEvents()
         try:
+            self._log(f"Converting to v{target_version} -> {path}")
             self.cachefile.convert_version(target_version, path)
             QMessageBox.information(self, "Convert", "Conversion completed.")
+            self._log(f"Conversion complete: {path}")
         except NotImplementedError:
             QMessageBox.warning(self, "Convert", "Conversion is not yet implemented in this build.")
+            self._log("Conversion not implemented in this build")
         except Exception as exc:
             QMessageBox.critical(self, "Convert", f"Conversion failed: {exc}")
+            self._log(f"Conversion failed: {exc}")
+        finally:
+            progress.close()
 
     # ------------------------------------------------------------------
     def _open_options(self) -> None:
         dialog = OptionsDialog(self.settings, self)
         if dialog.exec() == QDialog.Accepted:
-            self.preview_toggle_action.setChecked(dialog.preview_enabled)
+            pass
 
     # ------------------------------------------------------------------
     def _about(self) -> None:

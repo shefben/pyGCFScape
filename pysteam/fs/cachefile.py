@@ -323,25 +323,38 @@ class CacheFile:
         if not self.is_gcf():
             raise ValueError("Only GCF archives can be defragmented")
 
+        fragmented, used = self._get_item_fragmentation(0)
+        if fragmented == 0:
+            raise ValueError("Archive is already defragmented.")
+
         sector_size = self.data_header.sector_size
         terminator = self.alloc_table.terminator
 
         new_alloc = []
         data_chunks = []
 
-        # Rebuild allocation table and collect data sequentially.
-        for block in self.blocks.blocks:
-            sectors = list(block.sectors)
-            block._first_sector_index = len(new_alloc)
-            block.file_data_offset = len(new_alloc) * sector_size
-            block.file_data_size = len(sectors) * sector_size
+        # Step through each file in directory order and rebuild allocation
+        # tables so that all sectors are stored sequentially.  This mirrors the
+        # logic of HLLib's ``CGCFFile::DefragmentInternal`` but writes the result
+        # to a new archive on disk.
+        for mentry in self.manifest.manifest_entries:
+            if (mentry.directory_flags & CacheFileManifestEntry.FLAG_IS_FILE) == 0:
+                continue
 
-            for i, sector in enumerate(sectors):
-                data_chunks.append(sector.get_data())
-                if i == len(sectors) - 1:
-                    new_alloc.append(terminator)
-                else:
-                    new_alloc.append(len(new_alloc) + 1)
+            block = mentry.first_block
+            while block is not None:
+                sectors = list(block.sectors)
+                block._first_sector_index = len(new_alloc)
+                block.file_data_offset = len(new_alloc) * sector_size
+                block.file_data_size = len(sectors) * sector_size
+
+                for i, sector in enumerate(sectors):
+                    data_chunks.append(sector.get_data())
+                    if i == len(sectors) - 1:
+                        new_alloc.append(terminator)
+                    else:
+                        new_alloc.append(len(new_alloc) + 1)
+                block = block.next_block
 
         # Update tables with new allocation info
         self.alloc_table.entries = new_alloc
@@ -428,21 +441,20 @@ class CacheFile:
 
         # Flags
         # entry.flags = self.blocks[entry.index].entry_flags
-        # Entries of sectors
         entry.sectors = []
-        # Number of blocks in this entry.
-        entry.num_of_blocks = ceil(float(entry.size()) / float(self.data_header.sector_size))
+        entry.num_of_blocks = ceil(
+            float(entry.size()) / float(self.data_header.sector_size)
+        )
 
         for block in entry._manifest_entry.blocks:
             if block is None:
                 entry.sectors = []
-                entry.is_fragmented = False
-            else:
-                # Sector
-                entry.is_fragmented = block.is_fragmented
-                entry.sectors = block.sectors
-
+                break
+            entry.sectors.extend(block.sectors)
             self.complete_available += block.file_data_size
+
+        fragmented, _used = self._get_item_fragmentation(entry.index)
+        entry.is_fragmented = fragmented > 0
 
         entry.is_user_config = entry.index in self.manifest.user_config_entries
         entry.is_minimum_footprint = entry.index in self.manifest.minimum_footprint_entries
@@ -570,41 +582,128 @@ class CacheFile:
 
     # ------------------------------------------------------------------
     def is_fragmented(self) -> bool:
-        """Return ``True`` if any data blocks are marked as fragmented.
+        """Return ``True`` if the archive contains fragmented data blocks.
 
-        Only meaningful for GCF archives; NCF files do not store file data.
+        Uses a direct translation of HLLib's ``CGCFFile::GetItemFragmentation``
+        to examine the directory tree and count fragmented versus used data
+        blocks.  ``True`` is returned if any blocks are fragmented.  Only
+        meaningful for GCF archives; NCF files do not store file data.
         """
 
-        if not self.is_parsed or not self.is_gcf() or not self.blocks:
+        if not self.is_parsed or not self.is_gcf() or not self.manifest:
             return False
-        return any(block.is_fragmented for block in self.blocks.blocks)
+        fragmented, _used = self._get_item_fragmentation(0)
+        return fragmented > 0
 
     # ------------------------------------------------------------------
-    def validate(self):
-        """Validate file data and return a list of error strings.
+    def _validate_file(self, entry) -> str | None:
+        """Internal helper implementing HLLib's validation routine.
 
-        Each file contained in the archive is read and the number of bytes
-        retrieved is compared against the size recorded in the manifest.  If
-        any errors are encountered or the sizes do not match, a descriptive
-        message is appended to the returned list.  An empty list indicates
-        the archive appears to be valid.
+        Returns an error string if validation fails or ``None`` if the file
+        appears to be valid.  Encrypted files and files without a checksum are
+        treated as valid because their contents cannot be verified.
         """
+
+        manifest_entry = entry._manifest_entry
+
+        # Determine how much data is available by walking the block chain.
+        size = 0
+        block = manifest_entry.first_block
+        while block is not None:
+            size += block.file_data_size
+            block = block.next_block
+        if size != manifest_entry.item_size:
+            return "size mismatch"
+
+        if (
+            manifest_entry.directory_flags
+            & CacheFileManifestEntry.FLAG_IS_ENCRYPTED
+        ):
+            return None  # Can't validate encrypted data, assume OK.
+
+        if manifest_entry.checksum_index == 0xFFFFFFFF:
+            return None  # No checksum to validate against.
+
+        try:
+            count, first = self.checksum_map.entries[manifest_entry.checksum_index]
+        except Exception:
+            return "checksum index out of range"
+
+        stream = entry.open("rb")
+        try:
+            for i in range(count):
+                chunk = stream.read(CACHE_CHECKSUM_LENGTH)
+                if not chunk:
+                    break
+                chk = (adler32(chunk) & 0xFFFFFFFF) ^ (zlib.crc32(chunk) & 0xFFFFFFFF)
+                if chk != self.checksum_map.checksums[first + i]:
+                    return "checksum mismatch"
+        finally:
+            stream.close()
+
+        return None
+
+    def validate(self, progress=None):
+        """Validate file data and return a list of error strings."""
 
         errors = []
         if not self.is_parsed:
             return ["Cache file not parsed"]
 
-        for entry in self.root.all_files():
-            try:
-                stream = entry.open("rb")
-                data = stream.readall()
-                stream.close()
-                if len(data) != entry.size():
-                    errors.append(f"{entry.path()}: size mismatch")
-            except Exception as exc:  # pragma: no cover - validation errors
-                errors.append(f"{entry.path()}: {exc}")
+        files = self.root.all_files()
+        total = len(files)
+
+        for i, entry in enumerate(files):
+            error = self._validate_file(entry)
+            if error:
+                errors.append(f"{entry.path()}: {error}")
+            if progress:
+                try:
+                    progress(i + 1, total)
+                except Exception:
+                    pass
 
         return errors
+
+    def _get_item_fragmentation(self, item_index: int) -> tuple[int, int]:
+        """Return ``(fragmented, used)`` block counts for the given item.
+
+        This is a direct translation of ``CGCFFile::GetItemFragmentation``.  If
+        ``item_index`` refers to a folder the counts for all child items are
+        accumulated recursively.
+        """
+
+        entry = self.manifest.manifest_entries[item_index]
+        if (entry.directory_flags & CacheFileManifestEntry.FLAG_IS_FILE) == 0:
+            fragmented = 0
+            used = 0
+            child = entry.child_index
+            while child not in (0, 0xFFFFFFFF):
+                f, u = self._get_item_fragmentation(child)
+                fragmented += f
+                used += u
+                child = self.manifest.manifest_entries[child].next_index
+            return fragmented, used
+
+        terminator = self.alloc_table.terminator
+        last_sector = self.data_header.sector_count
+        fragmented = 0
+        used = 0
+
+        block = entry.first_block
+        while block is not None:
+            block_size = 0
+            sector_index = block._first_sector_index
+            while sector_index != terminator and block_size < block.file_data_size:
+                if last_sector != self.data_header.sector_count and last_sector + 1 != sector_index:
+                    fragmented += 1
+                used += 1
+                last_sector = sector_index
+                sector_index = self.alloc_table[sector_index]
+                block_size += self.data_header.sector_size
+            block = block.next_block
+
+        return fragmented, used
 
 class CacheFileHeader:
 

@@ -90,8 +90,11 @@ class MDLViewWidget(QWidget):
         """Return bounding box for a Source engine model."""
 
         # Offsets taken from ``studiohdr_t`` in the Source SDK.
-        if len(data) < 152:
+        # Some models store a zero-sized bounding box at the later offsets,
+        # so fall back to the hull bounds which are populated for most
+        # compiled models.
+        if len(data) < 144:
             return None
-        bbmin = struct.unpack_from("<3f", data, 128)
-        bbmax = struct.unpack_from("<3f", data, 140)
+        bbmin = struct.unpack_from("<3f", data, 96)
+        bbmax = struct.unpack_from("<3f", data, 108)
         return bbmin, bbmax
