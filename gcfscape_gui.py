@@ -125,6 +125,7 @@ class EntryItem(QTreeWidgetItem):
             QStyle.SP_FileIcon if self.entry.is_file() else QStyle.SP_DirIcon
         )
         if self.entry.is_file() and name.lower().endswith(".ico"):
+            stream = None
             try:
                 stream = self.entry.open("rb")
                 data = stream.readall()
@@ -133,6 +134,11 @@ class EntryItem(QTreeWidgetItem):
                     icon = QIcon(pix)
             except Exception:
                 pass
+            finally:
+                try:
+                    stream and stream.close()
+                except Exception:
+                    pass
         self.setIcon(0, icon)
 
     # ------------------------------------------------------------------
@@ -226,6 +232,13 @@ def _completion(entry) -> float:
     return 100.0 * min(1.0, avail / total)
 
 
+def _entry_location(entry) -> str:
+    """Return a display-friendly location path starting with ``root``."""
+
+    path = entry.path().lstrip("\\")
+    return f"root\\{path}" if path else "root\\"
+
+
 class PropertiesDialog(QDialog):
     """Dialog showing detailed information about an entry."""
 
@@ -244,6 +257,7 @@ class PropertiesDialog(QDialog):
             QStyle.SP_FileIcon if entry.is_file() else QStyle.SP_DirIcon
         )
         if entry.is_file() and entry.name.lower().endswith(".ico"):
+            stream = None
             try:
                 stream = entry.open("rb")
                 data = stream.readall()
@@ -252,6 +266,11 @@ class PropertiesDialog(QDialog):
                     icon = QIcon(pix)
             except Exception:
                 pass
+            finally:
+                try:
+                    stream and stream.close()
+                except Exception:
+                    pass
         icon_label.setPixmap(icon.pixmap(48, 48))
         name = entry.name or getattr(self.cache, "filename", "")
         header.addWidget(icon_label)
@@ -263,8 +282,7 @@ class PropertiesDialog(QDialog):
 
         if self.cache and entry is self.cache.root:
             form.addRow("Item type:", QLabel("Cache"))
-            location = str(self.window.current_path or "")
-            form.addRow("Location:", QLabel(location))
+            form.addRow("Location:", QLabel(_entry_location(entry)))
             form.addRow("Size:", QLabel(_format_bytes(entry.size())))
             blocks_used = self.cache.blocks.blocks_used if self.cache.blocks else 0
             sector_size = self.cache.header.sector_size
@@ -313,7 +331,7 @@ class PropertiesDialog(QDialog):
             )
         elif entry.is_folder():
             form.addRow("Item type:", QLabel("Folder"))
-            form.addRow("Location:", QLabel(entry.path()))
+            form.addRow("Location:", QLabel(_entry_location(entry)))
             form.addRow("Size:", QLabel(_format_bytes(entry.size())))
             files, folders = _count_items(entry)
             form.addRow(
@@ -336,7 +354,7 @@ class PropertiesDialog(QDialog):
             form.addRow("Fragmented:", QLabel("Yes" if frag else "No"))
         else:
             form.addRow("Item type:", QLabel("File"))
-            form.addRow("Location:", QLabel(entry.path()))
+            form.addRow("Location:", QLabel(_entry_location(entry)))
             form.addRow("Size:", QLabel(_format_bytes(entry.size())))
             sector = self.cache.header.sector_size if self.cache else 0
             blocks = getattr(entry, "num_of_blocks", 0)
@@ -484,7 +502,20 @@ class PreviewWidget(QWidget):
                 pass
 
         IMAGE_EXTS = {".gif", ".jpg", ".jpeg", ".bmp", ".png", ".tga", ".ico"}
-        TEXT_EXTS = {".res", ".txt", ".vmt", ".lst", ".xml", ".vdf", ".html"}
+        TEXT_EXTS = {
+            ".res",
+            ".txt",
+            ".vmt",
+            ".lst",
+            ".xml",
+            ".vdf",
+            ".html",
+            ".cfg",
+            ".inf",
+            ".css",
+            ".js",
+            ".ts",
+        }
 
         if ext == ".bsp":
             self.bsp_view.load_map(data)
@@ -776,8 +807,7 @@ class GCFScapeWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _load_file(self, path: Path) -> None:
         try:
-            with open(path, "rb") as handle:
-                self.cachefile = CacheFile.parse(handle)
+            self.cachefile = CacheFile.parse(path)
         except Exception as exc:  # pragma: no cover - GUI feedback
             traceback.print_exc()
             QMessageBox.critical(self, "Error", str(exc))
@@ -790,6 +820,11 @@ class GCFScapeWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _close_file(self) -> None:
+        if self.cachefile:
+            try:
+                self.cachefile.close()
+            except Exception:
+                pass
         self.cachefile = None
         self.current_path = None
         self.tree.clear()
@@ -848,7 +883,9 @@ class GCFScapeWindow(QMainWindow):
         for name, entry in sorted(folder.items.items()):
             self.file_list.addTopLevelItem(EntryItem(entry))
         self.preview.clear()
-        self.statusBar().showMessage(f"{folder.path()} ({len(folder.items)} items)")
+        self.statusBar().showMessage(
+            f"{_entry_location(folder)} ({len(folder.items)} items)"
+        )
 
     def _file_list_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         if isinstance(item, EntryItem) and item.entry.is_folder():
@@ -879,13 +916,20 @@ class GCFScapeWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _update_preview(self) -> None:
-        entry = self._current_entry()
+        source = self.sender()
+        entry = None
+        if isinstance(source, QTreeWidget):
+            item = source.currentItem()
+            if isinstance(item, EntryItem):
+                entry = item.entry
+        if not entry:
+            entry = self._current_entry()
         if not entry or entry.is_folder():
             self.preview.clear()
             return
 
         self.preview.set_entry(entry)
-        self.statusBar().showMessage(entry.path())
+        self.statusBar().showMessage(_entry_location(entry))
 
     # ------------------------------------------------------------------
     # Context menu and actions
@@ -981,12 +1025,7 @@ class GCFScapeWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _defragment(self) -> None:
-        """Run a lightweight fragmentation check.
-
-        The Python port does not currently support rewriting cache files, but
-        we mimic the behaviour of GCFScape by informing the user whether the
-        archive appears fragmented.
-        """
+        """Create a defragmented copy of the currently loaded archive."""
 
         if not self.cachefile:
             return
@@ -995,11 +1034,17 @@ class GCFScapeWindow(QMainWindow):
             QMessageBox.information(self, "Defragment", "Archive is already defragmented.")
             return
 
-        QMessageBox.warning(
-            self,
-            "Defragment",
-            "This archive appears fragmented.  Defragmentation is not yet implemented in this Python port.",
-        )
+        default = str(self.current_path.with_suffix(".defrag.gcf")) if self.current_path else ""
+        path, _ = QFileDialog.getSaveFileName(self, "Save Defragmented GCF", default, "GCF Files (*.gcf)")
+        if not path:
+            return
+        try:
+            self.cachefile.defragment(path)
+        except Exception as exc:  # pragma: no cover - GUI feedback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Defragment", str(exc))
+            return
+        QMessageBox.information(self, "Defragment", f"Defragmented archive written to {path}")
 
     # ------------------------------------------------------------------
     def _validate(self) -> None:

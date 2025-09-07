@@ -137,20 +137,40 @@ class CacheFile:
         self.complete_total = 0
         self.complete_available = 0
         self.ncf_folder_pattern = "common/%(name)s"
+        # ``stream`` represents the underlying cache file.  When ``parse`` is
+        # given a file path we open and own this handle.  If a file-like object
+        # is supplied we duplicate the handle so later extraction/defrag
+        # operations still have a live stream even after the caller's handle is
+        # closed.
+        self.stream = None
+        self._stream_owner = False
 
     # Main methods.
 
     @classmethod
-    def parse(cls, stream):
+    def parse(cls, source):
+        """Parse ``source`` into a :class:`CacheFile` instance.
+
+        ``source`` may be either a path-like object or an already opened
+        binary file handle.  In the latter case the handle may be closed after
+        parsing; the cache file keeps its own handle alive to service
+        subsequent extraction and conversion operations.
+        """
+
         self = cls()
+
+        if isinstance(source, (str, os.PathLike)):
+            stream = open(os.fspath(source), "rb")
+            self._stream_owner = True
+        else:
+            stream = source
 
         try:
             self.filename = os.path.split(os.path.realpath(stream.name))[1]
         except AttributeError:
-            pass
+            self.filename = None
 
         # Header
-        self.stream = stream
         self.header = CacheFileHeader(self)
         self.header.parse(stream.read(44))
         self.header.validate()
@@ -190,7 +210,24 @@ class CacheFile:
 
         self.is_parsed = True
         self._read_directory()
+
+        # If the caller supplied the stream we need to reopen the file so we
+        # still have a valid handle once the caller closes theirs.
+        if not self._stream_owner and hasattr(stream, "name"):
+            self.stream = open(stream.name, "rb")
+            self._stream_owner = True
+        else:
+            self.stream = stream
+
         return self
+
+    def close(self) -> None:
+        """Close the underlying file stream if we own it."""
+        if self._stream_owner and self.stream is not None:
+            try:
+                self.stream.close()
+            finally:
+                self.stream = None
 
     def convert_version(self, target_version: int, out_path: str) -> None:
         """Convert this cache file to a different GCF format version.
@@ -270,6 +307,69 @@ class CacheFile:
         self.header.format_version = original_version
         self.block_entry_map = original_block_entry_map
         self.manifest.manifest_map_entries = original_map_entries
+
+
+    def defragment(self, out_path: str) -> None:
+        """Write a defragmented copy of this GCF archive to ``out_path``.
+
+        The implementation rewrites the allocation table so that all sectors
+        for each block are stored sequentially.  A new cache file is written to
+        ``out_path``; the in-memory representation of this instance is left
+        untouched.  Only GCF archives are supported.
+        """
+
+        if not self.is_parsed:
+            raise ValueError("Cache file needs to be read first.")
+        if not self.is_gcf():
+            raise ValueError("Only GCF archives can be defragmented")
+
+        sector_size = self.data_header.sector_size
+        terminator = self.alloc_table.terminator
+
+        new_alloc = []
+        data_chunks = []
+
+        # Rebuild allocation table and collect data sequentially.
+        for block in self.blocks.blocks:
+            sectors = list(block.sectors)
+            block._first_sector_index = len(new_alloc)
+            block.file_data_offset = len(new_alloc) * sector_size
+            block.file_data_size = len(sectors) * sector_size
+
+            for i, sector in enumerate(sectors):
+                data_chunks.append(sector.get_data())
+                if i == len(sectors) - 1:
+                    new_alloc.append(terminator)
+                else:
+                    new_alloc.append(len(new_alloc) + 1)
+
+        # Update tables with new allocation info
+        self.alloc_table.entries = new_alloc
+        self.alloc_table.sector_count = len(new_alloc)
+        self.alloc_table.first_unused_entry = len(new_alloc)
+        self.blocks.blocks_used = len(self.blocks.blocks)
+        self.blocks.last_block_used = len(self.blocks.blocks) - 1
+        self.data_header.sector_count = len(new_alloc)
+        self.data_header.sectors_used = len(new_alloc)
+
+        with open(out_path, "wb") as out:
+            out.write(self.header.serialize())
+            out.write(self.blocks.serialize())
+            out.write(self.alloc_table.serialize())
+            if self.block_entry_map is not None:
+                out.write(self.block_entry_map.serialize())
+            out.write(self.manifest.header_data)
+            out.write(self.manifest.manifest_stream.getvalue())
+            out.write(self.checksum_map.serialize())
+
+            self.data_header.first_sector_offset = out.tell() + 24
+            out.write(self.data_header.serialize())
+            out.write(b"".join(data_chunks))
+
+        # Re-open the original stream in case subsequent operations are
+        # performed on this instance.
+        if self.stream is None and self.filename:
+            self.stream = open(self.filename, "rb")
 
 
     # Private Methods

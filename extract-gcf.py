@@ -22,13 +22,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    with open(args.cachefile, "rb") as cache_handle:
-        cache_file = CacheFile.parse(cache_handle)
-        output_dir = os.path.realpath(args.output)
-        if args.minimum:
-            cache_file.extract_minimum_footprint(output_dir)
-        else:
-            cache_file.extract(output_dir)
+    cache_file = CacheFile.parse(args.cachefile)
+    output_dir = os.path.realpath(args.output)
+    if args.minimum:
+        cache_file.extract_minimum_footprint(output_dir)
+    else:
+        cache_file.extract(output_dir)
 
 
 if __name__ == "__main__":
