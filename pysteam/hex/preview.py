@@ -1,4 +1,4 @@
-"""Hex/ASCII preview widget with linked selection."""
+"""Hex/ASCII preview widget with side-by-side text column."""
 from __future__ import annotations
 
 from typing import List
@@ -12,19 +12,17 @@ from PyQt5.QtWidgets import (
 )
 
 class HexViewWidget(QTableWidget):
-    """Display bytes in hex alongside ASCII with coupled selection."""
+    """Display bytes in hex with decoded text at the side."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setColumnCount(33)
-        headers = ["Offset"] + [f"{i:02X}" for i in range(16)] + [f"{i:02X}" for i in range(16)]
+        self.setColumnCount(18)
+        headers = ["Offset"] + [f"{i:02X}" for i in range(16)] + ["Decoded text"]
         self.setHorizontalHeaderLabels(headers)
         self.verticalHeader().setVisible(False)
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSelectionBehavior(QAbstractItemView.SelectItems)
-        self.itemSelectionChanged.connect(self._sync_selection)
-        self._syncing = False
 
     def clear(self) -> None:  # type: ignore[override]
         self.setRowCount(0)
@@ -37,33 +35,22 @@ class HexViewWidget(QTableWidget):
             offset_item = QTableWidgetItem(f"{row * 16:08X}")
             offset_item.setFlags(Qt.ItemIsEnabled)
             self.setItem(row, 0, offset_item)
+            ascii_chars: List[str] = []
             for col in range(16):
                 idx = row * 16 + col
-                hex_item = QTableWidgetItem("" if idx >= len(data) else f"{data[idx]:02X}")
-                asc_item = QTableWidgetItem("" if idx >= len(data) else chr(data[idx]) if 32 <= data[idx] < 127 else '.')
+                if idx >= len(data):
+                    hex_text = ""
+                    ascii_chars.append("")
+                else:
+                    byte = data[idx]
+                    hex_text = f"{byte:02X}"
+                    ascii_chars.append(chr(byte) if 32 <= byte < 127 else ".")
+                hex_item = QTableWidgetItem(hex_text)
                 hex_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                asc_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 self.setItem(row, 1 + col, hex_item)
-                self.setItem(row, 17 + col, asc_item)
-        for col in range(33):
+            ascii_item = QTableWidgetItem("".join(ascii_chars))
+            ascii_item.setFlags(Qt.ItemIsEnabled)
+            self.setItem(row, 17, ascii_item)
+        for col in range(17):
             self.horizontalHeader().resizeSection(col, 24)
-
-    def _sync_selection(self) -> None:
-        if self._syncing:
-            return
-        self._syncing = True
-        try:
-            selected = self.selectedIndexes()
-            for index in selected:
-                row = index.row()
-                col = index.column()
-                if 1 <= col <= 16:
-                    counterpart = self.model().index(row, col + 16)
-                    if counterpart not in selected:
-                        self.selectionModel().select(counterpart, self.selectionModel().Select)
-                elif 17 <= col <= 32:
-                    counterpart = self.model().index(row, col - 16)
-                    if counterpart not in selected:
-                        self.selectionModel().select(counterpart, self.selectionModel().Select)
-        finally:
-            self._syncing = False
+        self.horizontalHeader().resizeSection(17, 160)

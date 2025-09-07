@@ -50,6 +50,7 @@ from PyQt5.QtCore import (
     QSize,
     QMimeData,
     QUrl,
+    QModelIndex,
 )
 from PyQt5.QtGui import QIcon, QCloseEvent, QPixmap, QDesktopServices, QDrag
 from PyQt5.QtWidgets import (
@@ -190,6 +191,7 @@ class FileListWidget(QTreeWidget):
         super().__init__()
         self.window = window
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragOnly)
         
@@ -226,9 +228,13 @@ class FileListWidget(QTreeWidget):
 
     # ------------------------------------------------------------------
     def mousePressEvent(self, event):  # type: ignore[override]
-        index = self.indexAt(event.pos())
-        if index.isValid() and index.column() != 0:
-            return
+        if self.window.view_mode in ("details", "list"):
+            index = self.indexAt(event.pos())
+            if index.isValid() and index.column() != 0:
+                super().mousePressEvent(event)
+                self.clearSelection()
+                self.setCurrentIndex(QModelIndex())
+                return
         super().mousePressEvent(event)
 
 
@@ -1261,7 +1267,10 @@ class GCFScapeWindow(QMainWindow):
             self.file_list.addTopLevelItem(EntryItem(entry))
         self.preview_widget.clear()
         self.preview_dock.hide()
-        self.address.setText(folder.path())
+        path = folder.path().replace("/", "\\")
+        if not path.startswith("root\\"):
+            path = "root\\" + path.lstrip("\\")
+        self.address.setText(path)
         self.statusBar().showMessage(
             f"{_entry_location(folder)} ({len(folder.items)} items)"
         )

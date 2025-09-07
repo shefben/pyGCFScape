@@ -82,30 +82,6 @@ class MDLViewWidget(QWidget):
         self.scene.addPixmap(pixmap)
         self.view.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
 
-
-class _ZoomView(QGraphicsView):
-    def __init__(self):
-        super().__init__()
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-
-    def wheelEvent(self, event):
-        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
-        self.scale(factor, factor)
-
-    def keyPressEvent(self, event):
-        step = 20
-        if event.key() == Qt.Key_Left:
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - step)
-        elif event.key() == Qt.Key_Right:
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + step)
-        elif event.key() == Qt.Key_Up:
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - step)
-        elif event.key() == Qt.Key_Down:
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() + step)
-        else:
-            super().keyPressEvent(event)
-
     # ------------------------------------------------------------------
     def _goldsrc_bounds(self, data: bytes) -> Tuple[Vector, Vector] | None:
         """Return bounding box for a Goldsource model."""
@@ -133,3 +109,27 @@ class _ZoomView(QGraphicsView):
         hull_min = struct.unpack_from("<3f", data, 104)
         hull_max = struct.unpack_from("<3f", data, 116)
         return hull_min, hull_max
+
+
+class _ZoomView(QGraphicsView):
+    def __init__(self):
+        super().__init__()
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+
+    def wheelEvent(self, event):
+        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+        self.scale(factor, factor)
+
+    def keyPressEvent(self, event):
+        step = 20
+        if event.key() == Qt.Key_Left:
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - step)
+        elif event.key() == Qt.Key_Right:
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + step)
+        elif event.key() == Qt.Key_Up:
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - step)
+        elif event.key() == Qt.Key_Down:
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() + step)
+        else:
+            super().keyPressEvent(event)
