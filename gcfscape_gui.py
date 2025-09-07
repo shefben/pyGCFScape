@@ -39,7 +39,7 @@ import shutil
 import fnmatch
 import re
 from pathlib import Path
-from typing import Iterable, List
+from typing import Callable, Iterable, List
 
 from PyQt5.QtCore import (
     QObject,
@@ -87,6 +87,8 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QAbstractItemView,
     QDockWidget,
+    QFrame,
+    QListView,
 )
 
 # The pysteam cache file parser is used to read GCF/NCF archives.  It
@@ -179,6 +181,14 @@ class EntryItem(QTreeWidgetItem):
         self.setText(6, backup)
         self.setText(7, hex(flags))
         self.setText(8, frag)
+
+    # ------------------------------------------------------------------
+    def __lt__(self, other: QTreeWidgetItem) -> bool:  # type: ignore[override]
+        column = self.treeWidget().sortColumn() if self.treeWidget() else 0
+        if column == 2 and isinstance(other, QTreeWidgetItem):
+            if self.text(2) == other.text(2):
+                return self.text(0).lower() < other.text(0).lower()
+        return super().__lt__(other)
 
     # ------------------------------------------------------------------
     def path(self) -> str:
@@ -580,6 +590,7 @@ class PreviewWidget(QWidget):
         self.stack.addWidget(self.mdl_view)
         self.stack.addWidget(self.hex_view)
         layout.addWidget(self.stack)
+        self.key_provider: Callable[[], bytes | None] | None = None
 
     # ------------------------------------------------------------------
     def clear(self) -> None:
@@ -599,7 +610,8 @@ class PreviewWidget(QWidget):
         ext = os.path.splitext(name)[1]
         key = None
         if is_encrypted(entry):
-            key = self._request_key()
+            if self.key_provider:
+                key = self.key_provider()
             if key is None:
                 self.clear()
                 return
@@ -652,16 +664,6 @@ class PreviewWidget(QWidget):
             self.hex_view.load_data(data)
             self.stack.setCurrentWidget(self.hex_view)
 
-    # ------------------------------------------------------------------
-    def _request_key(self) -> bytes | None:
-        text, ok = QInputDialog.getText(self, "Encrypted file", "Enter decryption key:")
-        if not ok or not text:
-            return None
-        try:
-            return bytes.fromhex(text)
-        except ValueError:
-            return text.encode("utf-8")
-
 
 # ---------------------------------------------------------------------------
 # Main application window
@@ -681,6 +683,7 @@ class GCFScapeWindow(QMainWindow):
 
         self.cachefile: CacheFile | None = None
         self.current_path: Path | None = None
+        self._decryption_key: bytes | None = None
         self.entry_to_tree_item: dict = {}
         self.history: List = []
         self.history_index = -1
@@ -768,6 +771,7 @@ class GCFScapeWindow(QMainWindow):
         self.setCentralWidget(main_splitter)
 
         self.preview_widget = PreviewWidget()
+        self.preview_widget.key_provider = self._get_decryption_key
         self.preview_dock = QDockWidget("Preview", self)
         self.preview_dock.setAllowedAreas(
             Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea
@@ -781,8 +785,20 @@ class GCFScapeWindow(QMainWindow):
         # ------------------------------------------------------------------
         status = QStatusBar()
         self.setStatusBar(status)
-        self.info_label = QLabel()
-        status.addPermanentWidget(self.info_label, 1)
+        self.path_label = QLabel()
+        self.size_label = QLabel()
+        self.version_label = QLabel()
+        self.count_label = QLabel()
+        for widget in (
+            self.path_label,
+            self._status_separator(),
+            self.size_label,
+            self._status_separator(),
+            self.version_label,
+            self._status_separator(),
+            self.count_label,
+        ):
+            status.addPermanentWidget(widget)
         self.progress_bar = QProgressBar()
         self.progress_bar.hide()
         status.addPermanentWidget(self.progress_bar)
@@ -973,6 +989,13 @@ class GCFScapeWindow(QMainWindow):
 
         self.console.appendPlainText(message)
 
+    # ------------------------------------------------------------------
+    def _status_separator(self) -> QFrame:
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        return sep
+
     def _current_entry(self):
         """Return the entry associated with the current selection."""
         item = self.file_list.currentItem()
@@ -985,7 +1008,10 @@ class GCFScapeWindow(QMainWindow):
 
     def _update_status_info(self) -> None:
         if not self.cachefile or not self.current_path:
-            self.info_label.setText("")
+            self.path_label.clear()
+            self.size_label.clear()
+            self.version_label.clear()
+            self.count_label.clear()
             return
         complete, total = self.cachefile.count_complete_files()
         size = self.current_path.stat().st_size if self.current_path.exists() else 0
@@ -998,9 +1024,10 @@ class GCFScapeWindow(QMainWindow):
         else:
             size_str = f"{size} bytes"
         version = getattr(self.cachefile.header, "format_version", "?")
-        self.info_label.setText(
-            f"{self.current_path} | {size_str} | v{version} | {complete} / {total}"
-        )
+        self.path_label.setText(str(self.current_path))
+        self.size_label.setText(size_str)
+        self.version_label.setText(f"v{version}")
+        self.count_label.setText(f"{complete} / {total}")
 
     def _navigate_to(self, entry, record: bool = True) -> None:
         item = self.entry_to_tree_item.get(entry)
@@ -1106,6 +1133,19 @@ class GCFScapeWindow(QMainWindow):
         else:
             self.file_list.setHeaderHidden(True)
             self.file_list.setColumnCount(1)
+            if hasattr(self.file_list, "setViewMode"):
+                if mode == "list":
+                    self.file_list.setViewMode(QListView.ListMode)
+                    if hasattr(self.file_list, "setWrapping"):
+                        self.file_list.setWrapping(False)
+                else:
+                    self.file_list.setViewMode(QListView.IconMode)
+                    if hasattr(self.file_list, "setFlow"):
+                        self.file_list.setFlow(QListView.LeftToRight)
+                    if hasattr(self.file_list, "setWrapping"):
+                        self.file_list.setWrapping(True)
+                    if hasattr(self.file_list, "setResizeMode"):
+                        self.file_list.setResizeMode(QListView.Adjust)
             if mode == "large":
                 self.file_list.setIconSize(QSize(64, 64))
             elif mode == "small":
@@ -1169,6 +1209,7 @@ class GCFScapeWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _load_file(self, path: Path) -> None:
+        self._decryption_key = None
         try:
             self.cachefile = CacheFile.parse(path)
         except Exception as exc:  # pragma: no cover - GUI feedback
@@ -1197,6 +1238,7 @@ class GCFScapeWindow(QMainWindow):
         self.file_list.clear()
         self.preview_widget.clear()
         self.preview_dock.hide()
+        self._decryption_key = None
         self.statusBar().clearMessage()
         self.entry_to_tree_item.clear()
         self.history.clear()
@@ -1358,6 +1400,7 @@ class GCFScapeWindow(QMainWindow):
         except Exception as exc:
             self.preview_widget.deleteLater()
             self.preview_widget = PreviewWidget()
+            self.preview_widget.key_provider = self._get_decryption_key
             self.preview_dock.setWidget(self.preview_widget)
             self.preview_dock.hide()
             self._log(f"Preview error for {entry.path()}: {exc}")
@@ -1431,13 +1474,9 @@ class GCFScapeWindow(QMainWindow):
 
         key = None
         if any(is_encrypted(f) for f in files):
-            text, ok = QInputDialog.getText(self, "Encrypted file", "Enter decryption key:")
-            if not ok or not text:
+            key = self._get_decryption_key()
+            if key is None:
                 return
-            try:
-                key = bytes.fromhex(text)
-            except ValueError:
-                key = text.encode("utf-8")
 
         worker = ExtractionWorker(files, dest, key, self)
         progress = QProgressDialog("Extracting…", "Cancel", 0, 100, self)
@@ -1454,6 +1493,19 @@ class GCFScapeWindow(QMainWindow):
         if not worker.isRunning():
             QMessageBox.information(self, "Extraction complete", f"Extracted to {dest}")
             self._log(f"Extraction complete: {dest}")
+
+    # ------------------------------------------------------------------
+    def _get_decryption_key(self) -> bytes | None:
+        if self._decryption_key is not None:
+            return self._decryption_key
+        text, ok = QInputDialog.getText(self, "Encrypted file", "Enter decryption key:")
+        if not ok or not text:
+            return None
+        try:
+            self._decryption_key = bytes.fromhex(text)
+        except ValueError:
+            self._decryption_key = text.encode("utf-8")
+        return self._decryption_key
 
     # ------------------------------------------------------------------
     def _copy_text(self, text: str) -> None:

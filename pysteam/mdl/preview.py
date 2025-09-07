@@ -1,52 +1,62 @@
-"""Qt widget that draws a simple preview of Valve MDL models.
+"""Qt widget that renders a very small 3D preview of Valve MDL models.
 
-The implementation is intentionally lightweight – it does not attempt to render
-textured meshes or support camera interaction.  Instead it reads the model
-bounding box from the MDL header and draws a wireframe rectangle representing
-the front view.  This mirrors the minimalist preview behaviour in other parts
-of the application and keeps the dependency footprint small.
+The original implementation only displayed a 2D rectangle representing the
+model's bounding box.  This module replaces that approach with a lightweight
+``pyqtgraph`` based viewer that renders the bounding box as a 3D wireframe.
 
-When a model is selected the widget automatically detects whether it targets the
-Goldsource or Source engine and adjusts the bounding box offsets accordingly.
+Rendering full geometry for MDL files requires parsing additional companion
+files (``.vvd``/``.vtx`` for Source models) and is out of scope for this
+project, but the bounding box is still a useful visual cue when browsing
+archives.
 """
 
 from __future__ import annotations
 
 import struct
-from typing import Tuple
+from typing import List, Tuple
 
-from PyQt5.QtCore import QPointF, Qt
-from PyQt5.QtGui import QPainter, QPixmap
-from PyQt5.QtWidgets import (
-    QGraphicsScene,
-    QGraphicsView,
-    QVBoxLayout,
-    QWidget,
-)
+from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from . import detect_engine
 
+# ``pyqtgraph`` and ``numpy`` are optional dependencies.  Import them lazily so
+# we can show a helpful message when missing.
+try:  # pragma: no cover - optional dependencies
+    import numpy as np  # type: ignore
+    import pyqtgraph.opengl as gl  # type: ignore
+except Exception:  # pragma: no cover - missing optional deps
+    np = None  # type: ignore
+    gl = None  # type: ignore
+
 Vector = Tuple[float, float, float]
 
+
 class MDLViewWidget(QWidget):
-    """Widget capable of displaying a crude MDL preview."""
+    """Widget capable of displaying a crude 3D MDL preview."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.view = _ZoomView()
-        self.scene = QGraphicsScene(self)
-        self.view.setScene(self.scene)
-        layout.addWidget(self.view)
+        if gl is None or np is None:
+            self.view: QWidget = QLabel("pyqtgraph or numpy module missing")
+            layout.addWidget(self.view)
+        else:
+            self.view = gl.GLViewWidget()
+            self.view.setBackgroundColor("k")
+            layout.addWidget(self.view)
+            self._items: List[gl.GLGraphicsItem] = []
 
     # ------------------------------------------------------------------
     def clear(self) -> None:
-        self.scene.clear()
+        if gl and hasattr(self, "_items"):
+            for item in self._items:
+                self.view.removeItem(item)
+            self._items.clear()
 
     # ------------------------------------------------------------------
     def load_model(self, data: bytes) -> None:
-        """Render ``data`` containing an MDL model into the label."""
+        """Render ``data`` containing an MDL model into the widget."""
 
         engine = detect_engine(data)
         bbox = None
@@ -55,32 +65,48 @@ class MDLViewWidget(QWidget):
         elif engine == "Source":
             bbox = self._source_bounds(data)
         if bbox is None:
-            self.scene.clear()
-            self.scene.addText("Unsupported MDL")
+            if isinstance(self.view, QLabel):
+                self.view.setText("Unsupported MDL")
             return
+
+        if not (gl and np):
+            if isinstance(self.view, QLabel):
+                self.view.setText("pyqtgraph or numpy module missing")
+            return
+
+        self.clear()
         self.view.setToolTip(f"{engine} model")
+
         (min_x, min_y, min_z), (max_x, max_y, max_z) = bbox
-        width = max_x - min_x or 1.0
-        height = max_z - min_z or 1.0
-        pixmap = QPixmap(300, 300)
-        pixmap.fill(Qt.black)
-        painter = QPainter(pixmap)
-        painter.setPen(Qt.white)
-        scale = min((pixmap.width() - 20) / width, (pixmap.height() - 20) / height)
-        def map_pt(x: float, z: float) -> QPointF:
-            return QPointF((x - min_x) * scale + 10, (max_z - z) * scale + 10)
-        pts = [
-            map_pt(min_x, min_z),
-            map_pt(max_x, min_z),
-            map_pt(max_x, max_z),
-            map_pt(min_x, max_z),
+        verts = np.array([
+            [min_x, min_y, min_z],
+            [max_x, min_y, min_z],
+            [max_x, max_y, min_z],
+            [min_x, max_y, min_z],
+            [min_x, min_y, max_z],
+            [max_x, min_y, max_z],
+            [max_x, max_y, max_z],
+            [min_x, max_y, max_z],
+        ], dtype=float)
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
         ]
-        for i in range(len(pts)):
-            painter.drawLine(pts[i], pts[(i + 1) % len(pts)])
-        painter.end()
-        self.scene.clear()
-        self.scene.addPixmap(pixmap)
-        self.view.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+        for a, b in edges:
+            pts = verts[[a, b]]
+            item = gl.GLLinePlotItem(pos=pts, color=(1, 1, 1, 1), width=1, mode="line_strip")
+            self.view.addItem(item)
+            self._items.append(item)
+
+        center = [
+            (min_x + max_x) / 2,
+            (min_y + max_y) / 2,
+            (min_z + max_z) / 2,
+        ]
+        size = max(max_x - min_x, max_y - min_y, max_z - min_z) or 1.0
+        self.view.opts["center"] = center
+        self.view.opts["distance"] = size * 2
 
     # ------------------------------------------------------------------
     def _goldsrc_bounds(self, data: bytes) -> Tuple[Vector, Vector] | None:
@@ -110,26 +136,3 @@ class MDLViewWidget(QWidget):
         hull_max = struct.unpack_from("<3f", data, 116)
         return hull_min, hull_max
 
-
-class _ZoomView(QGraphicsView):
-    def __init__(self):
-        super().__init__()
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-
-    def wheelEvent(self, event):
-        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
-        self.scale(factor, factor)
-
-    def keyPressEvent(self, event):
-        step = 20
-        if event.key() == Qt.Key_Left:
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - step)
-        elif event.key() == Qt.Key_Right:
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + step)
-        elif event.key() == Qt.Key_Up:
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - step)
-        elif event.key() == Qt.Key_Down:
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() + step)
-        else:
-            super().keyPressEvent(event)

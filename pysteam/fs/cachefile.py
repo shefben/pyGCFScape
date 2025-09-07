@@ -263,9 +263,27 @@ class CacheFile:
         if target_version not in (1, 3, 5, 6):
             raise ValueError("Unsupported GCF version: %d" % target_version)
 
+        header_owner = self.header.owner
+        self.header.owner = None
+        bem_owner = self.block_entry_map.owner if self.block_entry_map else None
+        if self.block_entry_map:
+            self.block_entry_map.owner = None
+        manifest_owner = self.manifest.owner
+        self.manifest.owner = None
+
         header = copy.deepcopy(self.header)
         block_entry_map = copy.deepcopy(self.block_entry_map)
         manifest = copy.deepcopy(self.manifest)
+
+        self.header.owner = header_owner
+        if self.block_entry_map:
+            self.block_entry_map.owner = bem_owner
+        self.manifest.owner = manifest_owner
+
+        header.owner = None
+        if block_entry_map:
+            block_entry_map.owner = None
+        manifest.owner = None
 
         header.format_version = target_version
 

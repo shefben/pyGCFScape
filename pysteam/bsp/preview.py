@@ -16,13 +16,22 @@ from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from . import detect_engine
 
+# ``bsp_tool``/``pyqtgraph``/``numpy`` are optional dependencies used for the
+# interactive 3D preview.  Import them individually so we can provide more
+# helpful error messages when one is missing.
 try:  # pragma: no cover - optional dependencies
     import bsp_tool  # type: ignore
-    import numpy as np
-    import pyqtgraph.opengl as gl
 except Exception:  # pragma: no cover - missing optional deps
     bsp_tool = None  # type: ignore
+
+try:  # pragma: no cover - optional dependencies
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - missing optional deps
     np = None  # type: ignore
+
+try:  # pragma: no cover - optional dependencies
+    import pyqtgraph.opengl as gl  # type: ignore
+except Exception:  # pragma: no cover - missing optional deps
     gl = None  # type: ignore
 
 
@@ -53,9 +62,17 @@ class BSPViewWidget(QWidget):
     def load_map(self, data: bytes) -> None:
         """Render ``data`` representing a BSP file into the widget."""
 
-        if not (bsp_tool and gl and np):
+        if not bsp_tool:
             if isinstance(self.view, QLabel):
-                self.view.setText("bsp_tool or pyqtgraph missing")
+                self.view.setText("bsp_tool module missing")
+            return
+        if not gl:
+            if isinstance(self.view, QLabel):
+                self.view.setText("pyqtgraph module missing")
+            return
+        if not np:
+            if isinstance(self.view, QLabel):
+                self.view.setText("numpy module missing")
             return
 
         self.clear()
