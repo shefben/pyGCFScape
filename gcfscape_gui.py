@@ -34,6 +34,10 @@ from __future__ import annotations
 import os
 import sys
 import traceback
+import tempfile
+import shutil
+import fnmatch
+import re
 from pathlib import Path
 from typing import Iterable, List
 
@@ -44,11 +48,15 @@ from PyQt5.QtCore import (
     QSettings,
     pyqtSignal,
     QSize,
+    QFileInfo,
+    QMimeData,
+    QUrl,
 )
-from PyQt5.QtGui import QIcon, QCloseEvent, QPixmap
+from PyQt5.QtGui import QIcon, QCloseEvent, QPixmap, QDesktopServices, QDrag
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
+    QActionGroup,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -63,6 +71,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPlainTextEdit,
+    QFileIconProvider,
     QSplitter,
     QStackedWidget,
     QStatusBar,
@@ -75,6 +84,8 @@ from PyQt5.QtWidgets import (
     QStyle,
     QVBoxLayout,
     QWidget,
+    QComboBox,
+    QAbstractItemView,
 )
 
 # The pysteam cache file parser is used to read GCF/NCF archives.  It
@@ -84,6 +95,9 @@ from pysteam.bsp.preview import BSPViewWidget
 from pysteam.image import ImageViewWidget
 from pysteam.vtf.preview import VTFViewWidget
 from pysteam.mdl.preview import MDLViewWidget
+
+
+ICON_PROVIDER = QFileIconProvider()
 def is_encrypted(entry) -> bool:
     """Return ``True`` if the manifest flags mark ``entry`` as encrypted."""
 
@@ -122,9 +136,11 @@ class EntryItem(QTreeWidgetItem):
         self.setText(0, name)
         self.setText(1, size)
         self.setText(2, etype)
-        icon = QApplication.style().standardIcon(
-            QStyle.SP_FileIcon if self.entry.is_file() else QStyle.SP_DirIcon
-        )
+        if self.entry.is_file():
+            icon = ICON_PROVIDER.icon(QFileInfo(name))
+        else:
+            icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
+
         if self.entry.is_file() and name.lower().endswith(".ico"):
             stream = None
             try:
@@ -142,9 +158,70 @@ class EntryItem(QTreeWidgetItem):
                     pass
         self.setIcon(0, icon)
 
+        flags = getattr(self.entry._manifest_entry, "directory_flags", 0) if hasattr(self.entry, "_manifest_entry") else 0
+        encrypted = "Yes" if flags & CacheFileManifestEntry.FLAG_IS_ENCRYPTED else "No"
+        copy_local = "Yes" if flags & (CacheFileManifestEntry.FLAG_IS_LOCKED | CacheFileManifestEntry.FLAG_IS_LAUNCH) else "No"
+        overwrite = "Yes" if not (flags & CacheFileManifestEntry.FLAG_IS_USER_CONFIG) else "No"
+        backup = "Yes" if flags & CacheFileManifestEntry.FLAG_BACKUP_PLZ else "No"
+        frag = ""
+        if self.entry.is_file():
+            try:
+                f, u = self.entry.package._get_item_fragmentation(self.entry._manifest_entry.index)
+                frag = f"{(f / u * 100):.1f}%" if u else "0%"
+            except Exception:
+                frag = "0%"
+        self.setText(3, encrypted)
+        self.setText(4, copy_local)
+        self.setText(5, overwrite)
+        self.setText(6, backup)
+        self.setText(7, hex(flags))
+        self.setText(8, frag)
+
     # ------------------------------------------------------------------
     def path(self) -> str:
         return self.entry.path()
+
+
+class FileListWidget(QTreeWidget):
+    """Tree widget listing files with drag extraction support."""
+
+    def __init__(self, window) -> None:  # type: ignore[override]
+        super().__init__()
+        self.window = window
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragOnly)
+
+    # ------------------------------------------------------------------
+    def startDrag(self, supportedActions: Qt.DropActions) -> None:  # type: ignore[override]
+        items = [i for i in self.selectedItems() if isinstance(i, EntryItem)]
+        if not items:
+            return
+
+        temp_dir = tempfile.mkdtemp(prefix="pysteam_drag_")
+        paths = []
+        for item in items:
+            entry = item.entry
+            try:
+                if entry.is_file():
+                    entry.extract(temp_dir, keep_folder_structure=True)
+                else:
+                    for f in entry.all_files():
+                        f.extract(temp_dir, keep_folder_structure=True)
+                rel = entry.path().lstrip("\\/").replace("\\", os.sep)
+                paths.append(os.path.join(temp_dir, rel))
+            except Exception:
+                pass
+        if not paths:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec_(Qt.CopyAction)
+        self.window._temp_dirs.append(temp_dir)
 
 
 class ExtractionWorker(QThread):
@@ -254,9 +331,10 @@ class PropertiesDialog(QDialog):
         header = QHBoxLayout()
 
         icon_label = QLabel()
-        icon = QApplication.style().standardIcon(
-            QStyle.SP_FileIcon if entry.is_file() else QStyle.SP_DirIcon
-        )
+        if entry.is_file():
+            icon = ICON_PROVIDER.icon(QFileInfo(entry.name))
+        else:
+            icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
         if entry.is_file() and entry.name.lower().endswith(".ico"):
             stream = None
             try:
@@ -399,17 +477,29 @@ class SearchDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Find")
-        self.resize(300, 100)
+        self.setWindowTitle("Search")
+        self.resize(360, 160)
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.pattern = QLineEdit()
-        form.addRow("Name contains:", self.pattern)
+        form.addRow("Find what:", self.pattern)
+        self.mode = QComboBox()
+        self.mode.addItems([
+            "Using wildcards",
+            "Substring",
+            "Whole String",
+            "Using Regex",
+        ])
+        form.addRow("Match:", self.mode)
+        self.case = QCheckBox("Case Sensitive")
+        form.addRow(self.case)
         layout.addLayout(form)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        buttons = QDialogButtonBox()
+        find_btn = buttons.addButton("Find", QDialogButtonBox.AcceptRole)
+        cancel_btn = buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
+        find_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
         layout.addWidget(buttons)
 
 
@@ -569,6 +659,13 @@ class GCFScapeWindow(QMainWindow):
         self.cachefile: CacheFile | None = None
         self.current_path: Path | None = None
         self.entry_to_tree_item: dict = {}
+        self.history: List = []
+        self.history_index = -1
+        self._suppress_history = False
+        self._temp_dirs: List[str] = []
+        self._search_mode = False
+        self._search_results: List = []
+        self._search_pattern = ""
 
         # ------------------------------------------------------------------
         # Central layout
@@ -592,8 +689,19 @@ class GCFScapeWindow(QMainWindow):
         self.tree.itemSelectionChanged.connect(self._update_preview)
         left_layout.addWidget(self.tree)
 
-        self.file_list = QTreeWidget()
-        self.file_list.setHeaderLabels(["Name", "Size", "Type"])
+        self.file_list = FileListWidget(self)
+        all_columns = [
+            "Name",
+            "Size",
+            "Type",
+            "Encrypted",
+            "Copy Locally",
+            "Overwrite Local Copy",
+            "Backup Local Copy",
+            "Flags",
+            "Fragmentation",
+        ]
+        self.file_list.setHeaderLabels(all_columns)
         self.file_list.setRootIsDecorated(False)
         self.file_list.setItemsExpandable(False)
         self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -605,14 +713,30 @@ class GCFScapeWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        for i in range(3, len(all_columns)):
+            header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+            self.file_list.setColumnHidden(i, True)
+        self.column_map = {name: idx for idx, name in enumerate(all_columns)}
 
         splitter.addWidget(left_widget)
         splitter.addWidget(self.file_list)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
 
+        address_layout = QHBoxLayout()
+        address_layout.addWidget(QLabel("Address:"))
+        self.address = QLineEdit()
+        self.address.setReadOnly(True)
+        address_layout.addWidget(self.address)
+
+        center_widget = QWidget()
+        center_layout = QVBoxLayout(center_widget)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.addLayout(address_layout)
+        center_layout.addWidget(splitter)
+
         main_splitter = QSplitter(Qt.Vertical)
-        main_splitter.addWidget(splitter)
+        main_splitter.addWidget(center_widget)
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
         main_splitter.addWidget(self.console)
@@ -622,6 +746,8 @@ class GCFScapeWindow(QMainWindow):
 
         self.preview_widget = PreviewWidget()
         self.preview_dialog = QDialog(self)
+        self.preview_dialog.setWindowTitle("Preview")
+        self.preview_dialog.resize(600, 400)
         layout = QVBoxLayout(self.preview_dialog)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.preview_widget)
@@ -631,9 +757,11 @@ class GCFScapeWindow(QMainWindow):
         # ------------------------------------------------------------------
         status = QStatusBar()
         self.setStatusBar(status)
+        self.info_label = QLabel()
+        status.addPermanentWidget(self.info_label, 1)
         self.progress_bar = QProgressBar()
         self.progress_bar.hide()
-        status.addPermanentWidget(self.progress_bar, 1)
+        status.addPermanentWidget(self.progress_bar)
 
         # ------------------------------------------------------------------
         # Actions
@@ -710,8 +838,49 @@ class GCFScapeWindow(QMainWindow):
         view_menu = menubar.addMenu("&View")
         view_menu.addAction(self.expand_action)
         view_menu.addAction(self.collapse_action)
+        view_menu.addSeparator()
+        self.large_icons_action = QAction("Large Icons", self, checkable=True)
+        self.small_icons_action = QAction("Small Icons", self, checkable=True)
+        self.list_action = QAction("List", self, checkable=True)
+        self.details_action = QAction("Details", self, checkable=True)
+        self.view_group = QActionGroup(self)
+        for act in (self.large_icons_action, self.small_icons_action, self.list_action, self.details_action):
+            self.view_group.addAction(act)
+        self.details_action.setChecked(True)
+        self.large_icons_action.triggered.connect(lambda: self._set_view_mode("large"))
+        self.small_icons_action.triggered.connect(lambda: self._set_view_mode("small"))
+        self.list_action.triggered.connect(lambda: self._set_view_mode("list"))
+        self.details_action.triggered.connect(lambda: self._set_view_mode("details"))
+        view_menu.addAction(self.large_icons_action)
+        view_menu.addAction(self.small_icons_action)
+        view_menu.addAction(self.list_action)
+        view_menu.addAction(self.details_action)
+        self.columns_menu = view_menu.addMenu("Columns")
+        self.column_actions = {}
+        for name in [
+            "Encrypted",
+            "Copy Locally",
+            "Overwrite Local Copy",
+            "Backup Local Copy",
+            "Flags",
+            "Fragmentation",
+        ]:
+            act = QAction(name, self, checkable=True)
+            act.toggled.connect(lambda checked, n=name: self._toggle_column(n, checked))
+            self.column_actions[name] = act
+            self.columns_menu.addAction(act)
 
         tools_menu = menubar.addMenu("&Tools")
+        batch_menu = tools_menu.addMenu("Batch")
+        batch_frag = QAction("Fragmentation Report", self)
+        batch_frag.triggered.connect(self._batch_fragmentation)
+        batch_defrag = QAction("Defragment", self)
+        batch_defrag.triggered.connect(self._batch_defragment)
+        batch_validate = QAction("Validate", self)
+        batch_validate.triggered.connect(self._batch_validate)
+        batch_menu.addAction(batch_frag)
+        batch_menu.addAction(batch_defrag)
+        batch_menu.addAction(batch_validate)
         tools_menu.addAction(self.defrag_action)
         tools_menu.addAction(self.validate_action)
         tools_menu.addAction(self.convert_v1_action)
@@ -737,8 +906,39 @@ class GCFScapeWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addAction(self.refresh_action)
 
+        self.addToolBarBreak()
+        nav_bar = QToolBar("Navigate", self)
+        nav_bar.setIconSize(QSize(16, 16))
+        self.addToolBar(nav_bar)
+
+        self.back_action_nav = QAction(
+            QApplication.style().standardIcon(QStyle.SP_ArrowBack), "Back", self
+        )
+        self.back_action_nav.triggered.connect(self._go_back)
+        nav_bar.addAction(self.back_action_nav)
+
+        self.forward_action_nav = QAction(
+            QApplication.style().standardIcon(QStyle.SP_ArrowForward), "Forward", self
+        )
+        self.forward_action_nav.triggered.connect(self._go_forward)
+        nav_bar.addAction(self.forward_action_nav)
+
+        self.up_action_nav = QAction(
+            QApplication.style().standardIcon(QStyle.SP_ArrowUp), "Up", self
+        )
+        self.up_action_nav.triggered.connect(self._go_up)
+        nav_bar.addAction(self.up_action_nav)
+
+        nav_bar.addSeparator()
+        nav_bar.addAction(self.find_action)
+
+        self.back_action_nav.setEnabled(False)
+        self.forward_action_nav.setEnabled(False)
+        self.up_action_nav.setEnabled(False)
+
         # Drag and drop support for convenience
         self.setAcceptDrops(True)
+        self._set_view_mode("details")
 
     # ------------------------------------------------------------------
     # Utility methods
@@ -758,6 +958,139 @@ class GCFScapeWindow(QMainWindow):
         if isinstance(item, EntryItem):
             return item.entry
         return None
+
+    def _update_status_info(self) -> None:
+        if not self.cachefile or not self.current_path:
+            self.info_label.setText("")
+            return
+        complete, total = self.cachefile.count_complete_files()
+        size = self.current_path.stat().st_size if self.current_path.exists() else 0
+        if size >= 1024 ** 3:
+            size_str = f"{size / (1024 ** 3):.2f} GB"
+        elif size >= 1024 ** 2:
+            size_str = f"{size / (1024 ** 2):.2f} MB"
+        elif size >= 1024:
+            size_str = f"{size / 1024:.2f} KB"
+        else:
+            size_str = f"{size} bytes"
+        version = getattr(self.cachefile.header, "format_version", "?")
+        self.info_label.setText(
+            f"{self.current_path} | {size_str} | v{version} | {complete} / {total}"
+        )
+
+    def _navigate_to(self, entry, record: bool = True) -> None:
+        item = self.entry_to_tree_item.get(entry)
+        if not item:
+            return
+        self._suppress_history = not record
+        self.tree.setCurrentItem(item)
+        self._suppress_history = False
+
+    def _open_entry(self, entry) -> None:
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="pysteam_open_")
+            entry.extract(temp_dir, keep_folder_structure=False)
+            path = os.path.join(temp_dir, entry.name)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            self._temp_dirs.append(temp_dir)
+        except Exception as exc:
+            QMessageBox.critical(self, "Open", str(exc))
+
+    def _select_entry(self, entry) -> None:
+        if entry.is_file():
+            parent = entry.folder
+            self._navigate_to(parent)
+            for i in range(self.file_list.topLevelItemCount()):
+                item = self.file_list.topLevelItem(i)
+                if isinstance(item, EntryItem) and item.entry is entry:
+                    self.file_list.setCurrentItem(item)
+                    break
+        else:
+            self._navigate_to(entry)
+
+    def _perform_search(self, pattern: str, mode: str, case: bool) -> None:
+        root = self.cachefile.root if self.cachefile else None
+        if not root or not pattern:
+            return
+        results = []
+        patt = pattern if case else pattern.lower()
+        stack = [root]
+        while stack:
+            entry = stack.pop()
+            name = entry.name if case else entry.name.lower()
+            match = False
+            if mode == "Using wildcards":
+                match = fnmatch.fnmatchcase(name, patt)
+            elif mode == "Substring":
+                match = patt in name
+            elif mode == "Whole String":
+                match = name == patt
+            elif mode == "Using Regex":
+                flags = 0 if case else re.IGNORECASE
+                match = re.search(pattern, entry.name, flags) is not None
+            if match:
+                results.append(entry)
+            if entry.is_folder():
+                stack.extend(entry.items.values())
+        if results:
+            self._display_search_results(pattern, results)
+        else:
+            QMessageBox.information(self, "Search", "No results found.")
+
+    def _display_search_results(self, pattern: str, results: List) -> None:
+        self._search_mode = True
+        self._search_results = results
+        self._search_pattern = pattern
+        self.file_list.clear()
+        for entry in results:
+            self.file_list.addTopLevelItem(EntryItem(entry))
+        self.address.setText(f"Search results for '{pattern}'")
+        msg = f"Search for '{pattern}' returned {len(results)} results."
+        self.statusBar().showMessage(msg)
+        self._log(msg)
+        self.preview_widget.clear()
+        self.preview_dialog.hide()
+
+    def _go_back(self) -> None:
+        if self.history_index > 0:
+            self.history_index -= 1
+            self._navigate_to(self.history[self.history_index], record=False)
+
+    def _go_forward(self) -> None:
+        if self.history_index < len(self.history) - 1:
+            self.history_index += 1
+            self._navigate_to(self.history[self.history_index], record=False)
+
+    def _go_up(self) -> None:
+        folder = self._current_directory()
+        if folder and getattr(folder, "owner", None):
+            self._navigate_to(folder.owner)
+
+    def _set_view_mode(self, mode: str) -> None:
+        if mode == "details":
+            self.file_list.setColumnCount(len(self.column_map))
+            self.file_list.setHeaderHidden(False)
+            for name, idx in self.column_map.items():
+                if idx < 3:
+                    self.file_list.setColumnHidden(idx, False)
+                else:
+                    action = self.column_actions.get(name)
+                    self.file_list.setColumnHidden(idx, not (action and action.isChecked()))
+        else:
+            self.file_list.setHeaderHidden(True)
+            self.file_list.setColumnCount(1)
+        if mode == "large":
+            self.file_list.setIconSize(QSize(64, 64))
+        elif mode == "small":
+            self.file_list.setIconSize(QSize(16, 16))
+        else:
+            self.file_list.setIconSize(QSize(32, 32))
+
+    def _toggle_column(self, name: str, checked: bool) -> None:
+        idx = self.column_map.get(name)
+        if idx is None:
+            return
+        self.file_list.setColumnHidden(idx, not checked)
 
     # ------------------------------------------------------------------
     def dragEnterEvent(self, event):  # type: ignore[override]
@@ -824,7 +1157,10 @@ class GCFScapeWindow(QMainWindow):
         self.current_path = path
         self._add_to_recent(path)
         self.statusBar().showMessage(str(path))
+        self.history.clear()
+        self.history_index = -1
         self._populate_tree()
+        self._update_status_info()
 
     # ------------------------------------------------------------------
     def _close_file(self) -> None:
@@ -841,6 +1177,15 @@ class GCFScapeWindow(QMainWindow):
         self.preview_dialog.hide()
         self.statusBar().clearMessage()
         self.entry_to_tree_item.clear()
+        self.history.clear()
+        self.history_index = -1
+        for d in self._temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+        self._temp_dirs.clear()
+        self.back_action_nav.setEnabled(False)
+        self.forward_action_nav.setEnabled(False)
+        self.up_action_nav.setEnabled(False)
+        self._update_status_info()
 
     # ------------------------------------------------------------------
     def _refresh(self) -> None:
@@ -885,7 +1230,21 @@ class GCFScapeWindow(QMainWindow):
         return None
 
     def _update_file_list(self) -> None:
+        if self._search_mode and self.sender() is self.tree:
+            self._search_mode = False
+            self._search_results = []
+            self._search_pattern = ""
         self.file_list.clear()
+        if self._search_mode:
+            for entry in self._search_results:
+                self.file_list.addTopLevelItem(EntryItem(entry))
+            self.preview_widget.clear()
+            self.preview_dialog.hide()
+            self.address.setText(f"Search results for '{self._search_pattern}'")
+            self.statusBar().showMessage(
+                f"Search for '{self._search_pattern}' returned {len(self._search_results)} results."
+            )
+            return
         folder = self._current_directory()
         if not folder:
             return
@@ -893,15 +1252,40 @@ class GCFScapeWindow(QMainWindow):
             self.file_list.addTopLevelItem(EntryItem(entry))
         self.preview_widget.clear()
         self.preview_dialog.hide()
+        self.address.setText(folder.path())
         self.statusBar().showMessage(
             f"{_entry_location(folder)} ({len(folder.items)} items)"
         )
 
+        if not self._suppress_history:
+            if self.history_index == -1 or self.history[self.history_index] is not folder:
+                self.history = self.history[: self.history_index + 1]
+                self.history.append(folder)
+                self.history_index += 1
+        self.back_action_nav.setEnabled(self.history_index > 0)
+        self.forward_action_nav.setEnabled(self.history_index < len(self.history) - 1)
+        root = self.cachefile.root if self.cachefile else None
+        self.up_action_nav.setEnabled(folder is not root)
+
     def _file_list_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
-        if isinstance(item, EntryItem) and item.entry.is_folder():
-            tree_item = self.entry_to_tree_item.get(item.entry)
+        if not isinstance(item, EntryItem):
+            return
+        entry = item.entry
+        if self._search_mode:
+            if entry.is_folder():
+                self._search_mode = False
+                self._search_results = []
+                self._search_pattern = ""
+                self._navigate_to(entry)
+            else:
+                self._open_entry(entry)
+            return
+        if entry.is_folder():
+            tree_item = self.entry_to_tree_item.get(entry)
             if tree_item:
                 self.tree.setCurrentItem(tree_item)
+        else:
+            self._open_entry(entry)
 
     # ------------------------------------------------------------------
     def _filter_tree(self, text: str) -> None:
@@ -919,10 +1303,14 @@ class GCFScapeWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _open_search_dialog(self) -> None:
+        if not self.cachefile:
+            return
         dialog = SearchDialog(self)
         if dialog.exec() == QDialog.Accepted:
-            pattern = dialog.pattern.text().lower()
-            self.search.setText(pattern)
+            pattern = dialog.pattern.text()
+            mode = dialog.mode.currentText()
+            case = dialog.case.isChecked()
+            self._perform_search(pattern, mode, case)
 
     # ------------------------------------------------------------------
     def _update_preview(self) -> None:
@@ -943,7 +1331,10 @@ class GCFScapeWindow(QMainWindow):
             self.preview_widget.set_entry(entry)
             self.preview_dialog.show()
         except Exception as exc:
-            self.preview_widget.clear()
+            self.preview_widget.deleteLater()
+            self.preview_widget = PreviewWidget()
+            layout = self.preview_dialog.layout()
+            layout.addWidget(self.preview_widget)
             self.preview_dialog.hide()
             self._log(f"Preview error for {entry.path()}: {exc}")
         self.statusBar().showMessage(_entry_location(entry))
@@ -973,6 +1364,11 @@ class GCFScapeWindow(QMainWindow):
         copy_path_action.triggered.connect(lambda: self._copy_text(entry.path()))
         menu.addAction(copy_path_action)
 
+        if self._search_mode and widget is self.file_list:
+            goto_action = QAction("Go To Directory", self)
+            goto_action.triggered.connect(lambda: self._go_to_directory(entry))
+            menu.addAction(goto_action)
+
         menu.addSeparator()
         props_action = QAction("Properties", self)
         props_action.triggered.connect(lambda: self._show_properties(entry))
@@ -981,6 +1377,14 @@ class GCFScapeWindow(QMainWindow):
         viewport = widget.viewport() if isinstance(widget, QTreeWidget) else None
         if viewport:
             menu.exec(viewport.mapToGlobal(pos))
+
+    # ------------------------------------------------------------------
+    def _go_to_directory(self, entry) -> None:
+        folder = entry.folder if entry.is_file() else entry
+        self._search_mode = False
+        self._search_results = []
+        self._search_pattern = ""
+        self._navigate_to(folder)
 
     # ------------------------------------------------------------------
     def _extract_all(self) -> None:
@@ -1060,10 +1464,16 @@ class GCFScapeWindow(QMainWindow):
         progress = QProgressDialog("Defragmenting…", None, 0, 0, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
-        QApplication.processEvents()
+
+        def cb(i, total):
+            if progress.maximum() != total:
+                progress.setMaximum(total)
+            progress.setValue(i)
+            QApplication.processEvents()
+
         try:
             self._log(f"Defragmenting to {path}")
-            self.cachefile.defragment(path)
+            self.cachefile.defragment(path, progress=cb)
         except Exception as exc:  # pragma: no cover - GUI feedback
             traceback.print_exc()
             QMessageBox.critical(self, "Defragment", str(exc))
@@ -1121,13 +1531,25 @@ class GCFScapeWindow(QMainWindow):
         if not path:
             return
 
-        progress = QProgressDialog("Converting…", None, 0, 0, self)
+        total = 0
+        if self.cachefile.data_header is not None:
+            total = (
+                self.cachefile.data_header.sectors_used
+                * self.cachefile.data_header.sector_size
+            )
+        progress = QProgressDialog("Converting…", None, 0, total, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
-        QApplication.processEvents()
+
+        def cb(written, total_bytes):
+            if progress.maximum() != total_bytes:
+                progress.setMaximum(total_bytes)
+            progress.setValue(written)
+            QApplication.processEvents()
+
         try:
             self._log(f"Converting to v{target_version} -> {path}")
-            self.cachefile.convert_version(target_version, path)
+            self.cachefile.convert_version(target_version, path, progress=cb)
             QMessageBox.information(self, "Convert", "Conversion completed.")
             self._log(f"Conversion complete: {path}")
         except NotImplementedError:
@@ -1138,6 +1560,76 @@ class GCFScapeWindow(QMainWindow):
             self._log(f"Conversion failed: {exc}")
         finally:
             progress.close()
+
+    # ------------------------------------------------------------------
+    def _batch_fragmentation(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Cache Files",
+            "",
+            "Cache Files (*.gcf *.ncf)",
+        )
+        for path in paths:
+            try:
+                cf = CacheFile.parse(path)
+                fragmented, used = cf._get_item_fragmentation(0)
+                percent = (fragmented / used * 100.0) if used else 0.0
+                status = "Fragmented" if fragmented else "Complete"
+                self._log(f"{path}: {percent:.2f}% ({status})")
+                cf.close()
+            except Exception as exc:
+                self._log(f"{path}: error {exc}")
+
+    # ------------------------------------------------------------------
+    def _batch_defragment(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Cache Files",
+            "",
+            "Cache Files (*.gcf *.ncf)",
+        )
+        for path in paths:
+            try:
+                cf = CacheFile.parse(path)
+                if not cf.is_gcf():
+                    self._log(f"{path}: skipping (not a GCF archive)")
+                    continue
+                if not cf.is_fragmented():
+                    self._log(f"{path}: already defragmented")
+                    continue
+                tmp = path + ".defrag"
+                cf.defragment(tmp)
+                cf.close()
+                os.replace(tmp, path)
+                cf2 = CacheFile.parse(path)
+                fragmented, used = cf2._get_item_fragmentation(0)
+                percent = (fragmented / used * 100.0) if used else 0.0
+                cf2.close()
+                self._log(f"{path}: defragmented ({percent:.2f}% fragmented)")
+            except Exception as exc:
+                self._log(f"{path}: defragment failed ({exc})")
+
+    # ------------------------------------------------------------------
+    def _batch_validate(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Cache Files",
+            "",
+            "Cache Files (*.gcf *.ncf)",
+        )
+        for path in paths:
+            try:
+                cf = CacheFile.parse(path)
+                errors = cf.validate()
+                cf.close()
+                if errors:
+                    self._log(f"{path}: {len(errors)} errors")
+                    for e in errors:
+                        self._log(f"  - {e}")
+                else:
+                    self._log(f"{path}: validation successful")
+            except Exception as exc:
+                self._log(f"{path}: validation failed ({exc})")
 
     # ------------------------------------------------------------------
     def _open_options(self) -> None:
@@ -1169,6 +1661,8 @@ class GCFScapeWindow(QMainWindow):
             if res != QMessageBox.Yes:
                 event.ignore()
                 return
+        for d in self._temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
         event.accept()
 
 

@@ -2,6 +2,9 @@
 import struct
 import os
 import zlib
+import copy
+
+from typing import Optional, Callable
 
 from pysteam.fs import DirectoryFolder, DirectoryFile, FilesystemPackage
 from math import ceil
@@ -229,7 +232,12 @@ class CacheFile:
             finally:
                 self.stream = None
 
-    def convert_version(self, target_version: int, out_path: str) -> None:
+    def convert_version(
+        self,
+        target_version: int,
+        out_path: str,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> None:
         """Convert this cache file to a different GCF format version.
 
         Parameters
@@ -253,63 +261,62 @@ class CacheFile:
         if target_version not in (1, 3, 5, 6):
             raise ValueError("Unsupported GCF version: %d" % target_version)
 
-        # Preserve original state so the in-memory representation remains
-        # unchanged after conversion.
-        original_version = self.header.format_version
-        original_block_entry_map = self.block_entry_map
-        original_map_entries = list(self.manifest.manifest_map_entries)
-        self.header.format_version = target_version
+        header = copy.deepcopy(self.header)
+        block_entry_map = copy.deepcopy(self.block_entry_map)
+        manifest = copy.deepcopy(self.manifest)
 
-        # Adjust mapping semantics based on the requested version.  Versions
-        # prior to 6 require a block entry map where manifest indices point to
-        # that map instead of direct block numbers.  Newer versions store block
-        # numbers directly and omit the block entry map entirely.
+        header.format_version = target_version
+
+        original_map_entries = list(manifest.manifest_map_entries)
+
         if target_version < 6:
-            if self.block_entry_map is None:
+            if block_entry_map is None:
                 bemap = CacheFileBlockEntryMap(self)
                 bemap.block_count = self.blocks.block_count
                 bemap.entries = list(range(self.blocks.block_count))
-                self.block_entry_map = bemap
-            inverse = {blk: idx for idx, blk in enumerate(self.block_entry_map.entries)}
-            self.manifest.manifest_map_entries = [inverse.get(i, i) for i in original_map_entries]
+                block_entry_map = bemap
+            inverse = {blk: idx for idx, blk in enumerate(block_entry_map.entries)}
+            manifest.manifest_map_entries = [inverse.get(i, i) for i in original_map_entries]
         else:
-            # Convert manifest map entries back to raw block indices and drop
-            # the block entry map from the output.
-            if self.block_entry_map is not None:
-                self.manifest.manifest_map_entries = [
-                    self.block_entry_map.entries[i] for i in original_map_entries
+            if block_entry_map is not None:
+                manifest.manifest_map_entries = [
+                    block_entry_map.entries[i] for i in original_map_entries
                 ]
-            self.block_entry_map = None
+            block_entry_map = None
 
         with open(out_path, "wb") as out:
-            out.write(self.header.serialize())
+            out.write(header.serialize())
             out.write(self.blocks.serialize())
             out.write(self.alloc_table.serialize())
 
-            if target_version < 6 and self.block_entry_map is not None:
-                out.write(self.block_entry_map.serialize())
+            if target_version < 6 and block_entry_map is not None:
+                out.write(block_entry_map.serialize())
 
-            # Manifest bytes were buffered during parsing so we can simply
-            # replay them.
-            out.write(self.manifest.header_data)
-            out.write(self.manifest.manifest_stream.getvalue())
+            out.write(manifest.serialize())
 
             out.write(self.checksum_map.serialize())
 
             if self.data_header is not None:
                 out.write(self.data_header.serialize())
 
-                # Copy raw sector data directly from the original stream.
+                total = self.data_header.sectors_used * self.data_header.sector_size
+                written = 0
                 self.stream.seek(self.data_header.first_sector_offset)
-                out.write(self.stream.read())
+                while written < total:
+                    chunk = self.stream.read(min(1024 * 1024, total - written))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+                    if progress:
+                        progress(written, total)
 
-        # Restore original state in memory
-        self.header.format_version = original_version
-        self.block_entry_map = original_block_entry_map
-        self.manifest.manifest_map_entries = original_map_entries
 
-
-    def defragment(self, out_path: str) -> None:
+    def defragment(
+        self,
+        out_path: str,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> None:
         """Write a defragmented copy of this GCF archive to ``out_path``.
 
         The implementation rewrites the allocation table so that all sectors
@@ -330,17 +337,21 @@ class CacheFile:
         sector_size = self.data_header.sector_size
         terminator = self.alloc_table.terminator
 
-        new_alloc = []
-        data_chunks = []
+        new_alloc: list[int] = []
+        data_chunks: list[bytes] = []
+
+        files = [
+            m
+            for m in self.manifest.manifest_entries
+            if (m.directory_flags & CacheFileManifestEntry.FLAG_IS_FILE) != 0
+        ]
+        total_files = len(files)
 
         # Step through each file in directory order and rebuild allocation
         # tables so that all sectors are stored sequentially.  This mirrors the
         # logic of HLLib's ``CGCFFile::DefragmentInternal`` but writes the result
         # to a new archive on disk.
-        for mentry in self.manifest.manifest_entries:
-            if (mentry.directory_flags & CacheFileManifestEntry.FLAG_IS_FILE) == 0:
-                continue
-
+        for idx, mentry in enumerate(files, 1):
             block = mentry.first_block
             while block is not None:
                 sectors = list(block.sectors)
@@ -355,6 +366,9 @@ class CacheFile:
                     else:
                         new_alloc.append(len(new_alloc) + 1)
                 block = block.next_block
+
+            if progress:
+                progress(idx, total_files)
 
         # Update tables with new allocation info
         self.alloc_table.entries = new_alloc
@@ -596,7 +610,7 @@ class CacheFile:
         return fragmented > 0
 
     # ------------------------------------------------------------------
-    def _validate_file(self, entry) -> str | None:
+    def _validate_file(self, entry) -> Optional[str]:
         """Internal helper implementing HLLib's validation routine.
 
         Returns an error string if validation fails or ``None`` if the file
@@ -631,13 +645,20 @@ class CacheFile:
 
         stream = entry.open("rb")
         try:
-            for i in range(count):
-                chunk = stream.read(CACHE_CHECKSUM_LENGTH)
-                if not chunk:
-                    break
+            remaining = manifest_entry.item_size
+            i = 0
+            while remaining > 0 and i < count:
+                to_read = min(CACHE_CHECKSUM_LENGTH, remaining)
+                chunk = stream.read(to_read)
+                if len(chunk) != to_read:
+                    return "size mismatch"
                 chk = (adler32(chunk) & 0xFFFFFFFF) ^ (zlib.crc32(chunk) & 0xFFFFFFFF)
                 if chk != self.checksum_map.checksums[first + i]:
                     return "checksum mismatch"
+                remaining -= to_read
+                i += 1
+            if remaining > 0:
+                return "size mismatch"
         finally:
             stream.close()
 
@@ -664,6 +685,26 @@ class CacheFile:
                     pass
 
         return errors
+
+    def count_complete_files(self) -> tuple[int, int]:
+        """Return a tuple of (complete, total) file counts."""
+        if not self.is_parsed or not self.manifest:
+            return (0, 0)
+
+        files = self.root.all_files()
+        complete = 0
+        for entry in files:
+            manifest_entry = getattr(entry, "_manifest_entry", None)
+            if not manifest_entry:
+                continue
+            size = 0
+            block = manifest_entry.first_block
+            while block is not None:
+                size += block.file_data_size
+                block = block.next_block
+            if size >= manifest_entry.item_size:
+                complete += 1
+        return complete, len(files)
 
     def _get_item_fragmentation(self, item_index: int) -> tuple[int, int]:
         """Return ``(fragmented, used)`` block counts for the given item.
@@ -1242,7 +1283,17 @@ class GCFFileStream:
         self.key = key
 
         sector_size = self.owner.data_header.sector_size
-        raw = b"".join(sect.get_data() for sect in self.entry.sectors)
+
+        sectors = getattr(self.entry, "sectors", None) or []
+        if not sectors:
+            sectors = []
+            for block in self.entry._manifest_entry.blocks:
+                if block is None:
+                    continue
+                sectors.extend(block.sectors)
+            self.entry.sectors = sectors
+
+        raw = b"".join(sect.get_data() for sect in sectors)
         if key:
             raw = decrypt_gcf_data(raw, key)
 
@@ -1364,28 +1415,24 @@ class GCFFileStream:
         data = []
 
         if size < 1:
-
             size = self.entry.item_size
             # Get all the data by looping over the sectors.
             for sector in self.sectors[sector_index:]:
-                data.append(sector[offset:min(sector_size, size)])
-                size -= sector_size
+                take = min(sector_size - offset, size)
+                data.append(sector[offset:offset + take])
+                size -= take
+                if size <= 0:
+                    break
                 offset = 0
-
+            self.position = self.entry.item_size
         else:
-
             while read_pos < size:
-
-                # It can't be bigger than the sector size or
-                # Take the minimum of the two and get the rest of the data on the next iteration.
-                read_length = min(size - read_pos, sector_size - offset)
-                data.append(self.sectors[sector_index][offset:read_length])
-
+                take = min(size - read_pos, sector_size - offset)
+                data.append(self.sectors[sector_index][offset:offset + take])
                 sector_index += 1
                 offset = 0
-
-            self.position += size
-            read_pos += size
+                read_pos += take
+            self.position += read_pos
 
         # TYPE CHANGE!
         # Data - from list to bytes.
