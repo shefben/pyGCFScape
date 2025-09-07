@@ -1,7 +1,7 @@
 
 import os
 
-class DirectoryFile(object):
+class DirectoryFile:
     def __init__(self, folder, name="", package=None):
         self.folder = folder
         self.name = name
@@ -30,7 +30,7 @@ class DirectoryFile(object):
     def sys_path(self):
         return os.path.join(self.folder.sys_path(), self.name)
 
-class DirectoryFolder(object):
+class DirectoryFolder:
     def __init__(self, parent, name="", package=None):
         self.owner = parent
         self.name = name
@@ -41,7 +41,7 @@ class DirectoryFolder(object):
         return self.items[name]
 
     def __iter__(self):
-        return self.items.values()
+        return iter(self.items.values())
 
     def __len__(self):
         return len(self.items)
@@ -85,7 +85,7 @@ class DirectoryFolder(object):
 
         return files
 
-class FilesystemPackage(object):
+class FilesystemPackage:
 
     def parse(self, dirname):
         rootpath = os.path.abspath(dirname)

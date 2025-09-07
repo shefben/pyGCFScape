@@ -6,7 +6,7 @@ import zlib
 
 from io import BytesIO
 
-class Blob(object):
+class Blob:
     MAGIC = 0x5001
     COMPRESSED_MAGIC = 0x4301
 
@@ -56,14 +56,14 @@ class Blob(object):
         return len(self.children)
 
     def __iter__(self):
-        return self.children.values()
+        return iter(self.children.values())
 
     def __getitem__(self, key):
         if isinstance(key, int):
             key = struct.pack("<L", key)
         return self.children[key]
 
-class BlobNode(object):
+class BlobNode:
     def __init__(self):
         self.key = None
         self.data = None

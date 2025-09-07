@@ -1,9 +1,11 @@
 
 import datetime
 import struct
+import time as time_module
 
-def bytes_as_bool(data):
-    return all(x != "\0" for x in data)
+
+def bytes_as_bool(data: bytes) -> bool:
+    return all(b != 0 for b in data)
 
 # Host (IP and Port) encoding and decoding
 # Little endian for some reason...
@@ -20,10 +22,11 @@ def decode_host(data):
     port, = struct.unpack("<H", data[4:])
     return (ip, port)
 
-def py_time(time):
-    unix = (time / 1000000) - 62135596800
-    microseconds = time % 1000000
+def py_time(raw_time: int) -> datetime.datetime:
+    unix = (raw_time / 1_000_000) - 62135596800
+    microseconds = raw_time % 1_000_000
     return datetime.datetime.fromtimestamp(unix) - datetime.timedelta(0, 0, microseconds)
 
-def steam_time(time):
-    return (time.mktime(time) + 62135596800) * 1000000
+
+def steam_time(tm) -> int:
+    return (time_module.mktime(tm) + 62135596800) * 1_000_000
