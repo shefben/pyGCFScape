@@ -2,7 +2,7 @@
 from pysteam.blob import Blob
 import struct
 
-class Registry(object):
+class Registry:
 
     def __init__(self):
         self.root = None
@@ -26,7 +26,7 @@ class Registry(object):
     def __iter__(self):
         return iter(self.root)
 
-class RegistryKey(object):
+class RegistryKey:
     def __init__(self, registry, owner):
         self.owner = owner
         self.registry = registry
@@ -54,9 +54,9 @@ class RegistryKey(object):
         return repr(self.items)
 
     def __iter__(self):
-        return self.items.itervalues()
+        return iter(self.items.values())
 
-class RegistryValue(object):
+class RegistryValue:
 
     TYPE_STRING = 0
     TYPE_DWORD = 1

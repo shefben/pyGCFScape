@@ -6,10 +6,8 @@ from pysteam.fs import DirectoryFolder, DirectoryFile, FilesystemPackage
 from math import ceil
 from zlib import adler32
 
-#try:
-from cStringIO import StringIO
-#except ImportError:
-    #from StringIO import StringIO
+# For Python 3 compatibility, use io.BytesIO instead of the removed cStringIO module.
+from io import BytesIO
 
 STEAM_TERMINATOR = "\\" # Hasta la vista, baby.
 
@@ -24,7 +22,7 @@ def pack_dword_list(list):
 def raise_parse_error(func):
     def internal(self, *args, **kwargs):
         if not self.is_parsed:
-            raise ValueError, "Cache file needs to be read first."
+            raise ValueError("Cache file needs to be read first.")
 
         return func(self, *args, **kwargs)
     return internal
@@ -32,12 +30,12 @@ def raise_parse_error(func):
 def raise_ncf_error(func):
     def internal(self, *args, **kwargs):
         if self.is_ncf():
-            raise ValueError, "NCF files do not have contents."
+            raise ValueError("NCF files do not have contents.")
 
         return func(self, *args, **kwargs)
     return internal
 
-class CacheFile(object):
+class CacheFile:
 
     # Constructor
     def __init__(self):
@@ -102,7 +100,7 @@ class CacheFile(object):
 
     ## def serialize(self):
 
-    ##     stream = StringIO()
+    ##     stream = BytesIO()
 
     ##     self.header.validate()
     ##     stream.write(self.header.serialize())
@@ -311,7 +309,7 @@ class CacheFile(object):
     def __getitem__(self, name):
         return self.root[name]
 
-class CacheFileHeader(object):
+class CacheFileHeader:
 
     def __init__(self, owner):
         self.owner = owner
@@ -331,7 +329,7 @@ class CacheFileHeader(object):
     def serialize(self):
         data = struct.pack("<10L", self.header_version, self.cache_type, self.format_version, self.application_id,
                            self.application_version, self.is_mounted, self.dummy1, self.file_size, self.sector_size, self.sector_count)
-        self.checksum = sum(ord(x) for x in data)
+        self.checksum = sum(data)
         return data + struct.pack("<L", self.checksum)
 
     def calculate_checksum(self):
@@ -341,22 +339,22 @@ class CacheFileHeader(object):
     def validate(self):
         # Check the usual stuff.
         if self.header_version != 1:
-            raise ValueError, "Invalid Cache File Header [HeaderVersion is not 1]"
+            raise ValueError("Invalid Cache File Header [HeaderVersion is not 1]")
         if not (self.is_ncf() or self.is_gcf()):
-            raise ValueError, "Invalid Cache File Header [Not GCF or NCF]"
+            raise ValueError("Invalid Cache File Header [Not GCF or NCF]")
         if self.is_ncf() and self.format_version != 1:
-            raise ValueError, "Invalid Cache File Header [Is NCF and version is not 1]"
+            raise ValueError("Invalid Cache File Header [Is NCF and version is not 1]")
         elif self.is_gcf() and self.format_version != 6:
-            raise ValueError, "Invalid Cache File Header [Is GCF and version is not 6]"
+            raise ValueError("Invalid Cache File Header [Is GCF and version is not 6]")
         # UPDATE: This fails on some files, namely the half-life files.
         #if self.is_mounted != 0:
         #   raise ValueError, "Invalid Cache File Header [Updating is not 0... WTF?]"
         if self.is_ncf() and self.file_size != 0:
-            raise ValueError, "Invalid Cache File Header [Is NCF and FileSize is not 0]"
+            raise ValueError("Invalid Cache File Header [Is NCF and FileSize is not 0]")
         if self.is_ncf() and self.sector_size != 0:
-            raise ValueError, "Invalid Cache File Header [Is NCF and BlockSize is not 0]"
+            raise ValueError("Invalid Cache File Header [Is NCF and BlockSize is not 0]")
         if self.is_ncf() and self.sector_count != 0:
-            raise ValueError, "Invalid Cache File Header [Is NCF and BlockCount is not 0]"
+            raise ValueError("Invalid Cache File Header [Is NCF and BlockCount is not 0]")
         #if self.checksum != self.calculate_checksum():
         #    raise ValueError, "Invalid Cache File Header [Checksums do not match]"
 
@@ -367,7 +365,7 @@ class CacheFileHeader(object):
     def get_blocks_length(self):
         return self.sector_size * self.sector_count + 32 # Block Size * Block Count + Block Header
 
-class CacheFileBlockAllocationTable(object):
+class CacheFileBlockAllocationTable:
 
     def __init__(self, owner):
         self.owner = owner
@@ -383,10 +381,10 @@ class CacheFileBlockAllocationTable(object):
          self.dummy2,
          self.dummy3,
          self.dummy4) = struct.unpack("<7L", stream.read(28))
-        self.checksum = sum(ord(x) for x in stream.read(4))
+        self.checksum = sum(stream.read(4))
 
         # Block Entries
-        for i in xrange(self.block_count):
+        for i in range(self.block_count):
             block = CacheFileBlockAllocationTableEntry(self)
             block.index = i
             block.parse(stream)
@@ -394,20 +392,20 @@ class CacheFileBlockAllocationTable(object):
 
     def serialize(self):
         data = struct.pack("<7L", self.block_count, self.blocks_used, self.last_block_used, self.dummy1, self.dummy2, self.dummy3, self.dummy4)
-        self.checksum = sum(ord(x) for x in data)
-        return data + struct.pack("<L", self.checksum) + "".join(x.serialize() for x in self.blocks)
+        self.checksum = sum(data)
+        return data + struct.pack("<L", self.checksum) + b"".join(x.serialize() for x in self.blocks)
 
     def calculate_checksum(self):
-        return sum(ord(x) for x in self.serialize()[:24])
+        return sum(self.serialize()[:24])
 
     def validate(self):
         if self.owner.header.sector_count != self.block_count:
-            raise ValueError, "Invalid Cache Block [Sector/BlockCounts do not match]"
+            raise ValueError("Invalid Cache Block [Sector/BlockCounts do not match]")
         #print self.checksum, self.calculate_checksum()
         #if self.checksum != self.calculate_checksum():
         #    raise ValueError, "Invalid Cache Block [Checksums do not match]"
 
-class CacheFileBlockAllocationTableEntry(object):
+class CacheFileBlockAllocationTableEntry:
 
     FLAG_DATA    = 0x200F8000
     FLAG_DATA_2  = 0x200FC000
@@ -477,7 +475,7 @@ class CacheFileBlockAllocationTableEntry(object):
     def serialize(self):
         return struct.pack("<2H6L", self.flags, self.dummy1, self.file_data_offset, self.file_data_size, self._first_sector_index, self._next_block_index, self._prev_block_index, self.manifest_index)
 
-class CacheFileAllocationTable(object):
+class CacheFileAllocationTable:
 
     def __init__(self, owner):
         self.owner = owner
@@ -493,7 +491,7 @@ class CacheFileAllocationTable(object):
         return len(self.entries)
 
     def __iter__(self):
-        return self.entries
+        return iter(self.entries)
 
     def parse(self, stream):
 
@@ -501,26 +499,26 @@ class CacheFileAllocationTable(object):
         (self.sector_count,
          self.first_unused_entry,
          self.is_long_terminator) = struct.unpack("<3L", stream.read(12))
-        self.checksum = sum(ord(x) for x in stream.read(4))
+        self.checksum = sum(stream.read(4))
 
         self.terminator = 0xFFFFFFFF if self.owner.alloc_table.is_long_terminator == 1 else 0xFFFF
         self.entries = unpack_dword_list(stream, self.sector_count)
 
     def serialize(self):
         data = struct.pack("<3L", self.sector_count, self.first_unused_entry, self.is_long_terminator)
-        self.checksum = sum(ord(x) for x in data)
+        self.checksum = sum(data)
         return data + struct.pack("<L", self.checksum) + pack_dword_list(self.entries)
 
     def calculate_checksum(self):
-        return sum(ord(x) for x in self.serialize()[:12])
+        return sum(self.serialize()[:12])
 
     def validate(self):
         if self.owner.header.sector_count != self.sector_count:
-            raise ValueError, "Invalid Cache Allocation Table [SectorCounts do not match]"
+            raise ValueError("Invalid Cache Allocation Table [SectorCounts do not match]")
         if self.checksum != self.calculate_checksum():
-            raise ValueError, "Invalid Cache Allocation Table [Checksums do not match]"
+            raise ValueError("Invalid Cache Allocation Table [Checksums do not match]")
 
-class CacheFileManifest(object):
+class CacheFileManifest:
 
     FLAG_BUILD_MODE   = 0x00000001
     FLAG_IS_PURGE_ALL = 0x00000002
@@ -561,10 +559,10 @@ class CacheFileManifest(object):
          self.checksum) = struct.unpack("<14L", self.header_data)
 
         # 56 = size of header
-        self.manifest_stream = StringIO(stream.read(self.binary_size-56))
+        self.manifest_stream = BytesIO(stream.read(self.binary_size - 56))
 
         # Manifest Entries
-        for i in xrange(self.node_count):
+        for i in range(self.node_count):
             entry = CacheFileManifestEntry(self)
             entry.index = i
             # 28 = size of ManifestEntry
@@ -623,29 +621,29 @@ class CacheFileManifest(object):
         manifest_data.append(pack_dword_list(self.hash_table_keys))
         manifest_data.append(struct.pack("<2L", self.map_header_version, self.map_dummy1))
         manifest_data.append(pack_dword_list(self.manifest_map_entries))
-        manifest_data = "".join(manifest_data)
+        manifest_data = b"".join(manifest_data)
 
-        self.checksum = adler32(self.header_data + "\0\0\0\0\0\0\0\0" + manifest_data, 0)
+        self.checksum = adler32(self.header_data + b"\0\0\0\0\0\0\0\0" + manifest_data, 0)
         return self.header_data + struct.pack("<2L", self.fingerprint, self.checksum) + manifest_data
 
     def validate(self):
         if self.owner.header.application_id != self.application_id:
-            raise ValueError, "Invalid Cache File Manifest [Application ID mismatch]"
+            raise ValueError("Invalid Cache File Manifest [Application ID mismatch]")
         if self.owner.header.application_version != self.application_version:
-            raise ValueError, "Invalid Cache File Manifest [Application version mismatch]"
+            raise ValueError("Invalid Cache File Manifest [Application version mismatch]")
         #if self.checksum != self.calculate_checksum():
         #    raise ValueError, "Invalid Cache File Manifest [Checksum mismatch]"
         if self.map_header_version != 1:
-            raise ValueError, "Invalid Cache File Manifest [ManifestHeaderMap's HeaderVersion is not 1]"
+            raise ValueError("Invalid Cache File Manifest [ManifestHeaderMap's HeaderVersion is not 1]")
         if self.map_dummy1 != 0:
-            raise ValueError, "Invalid Cache File Manifest [ManifestHeaderMap's Dummy1 is not 0]"
+            raise ValueError("Invalid Cache File Manifest [ManifestHeaderMap's Dummy1 is not 0]")
 
     def calculate_checksum(self):
         # Blank out checksum and fingerprint + hack to get unsigned value.
         data = self.serialize()
-        return adler32(data[:48] + "\0\0\0\0\0\0\0\0" + data[56:], 0) & 0xffffffffL
+        return adler32(data[:48] + b"\0\0\0\0\0\0\0\0" + data[56:], 0) & 0xffffffff
 
-class CacheFileManifestEntry(object):
+class CacheFileManifestEntry:
 
     FLAG_IS_FILE        = 0x00004000
     FLAG_IS_EXECUTABLE  = 0x00000800
@@ -663,11 +661,15 @@ class CacheFileManifestEntry(object):
         self.owner = owner
 
     def _get_name(self):
-        return self.owner.filename_table[self.name_offset:].split("\0")[0]
+        raw = self.owner.filename_table[self.name_offset:].split(b"\0", 1)[0]
+        return raw.decode('utf-8', errors='replace')
 
     def _set_name(self, value):
-        name_end = self.owner.filename_table[self.name_offset:].find("\0")
-        self.owner.filename_table[self.name_offset:name_end] = value
+        value_bytes = value.encode('utf-8')
+        name_end = self.owner.filename_table[self.name_offset:].find(b"\0")
+        table = bytearray(self.owner.filename_table)
+        table[self.name_offset:self.name_offset + name_end] = value_bytes
+        self.owner.filename_table = bytes(table)
 
     def _get_block_iterator(self):
         block = self.first_block
@@ -699,7 +701,7 @@ class CacheFileManifestEntry(object):
     def serialize(self):
         return struct.pack("<7L", self.name_offset, self.item_size, self.checksum_index, self.directory_flags, self.parent_index, self.next_index, self.child_index)
 
-class CacheFileChecksumMap(object):
+class CacheFileChecksumMap:
 
     FLAG_IS_SIGNED      = 0x00000001
     FLAG_UNKNOWN        = 0xFFFFFFFE
@@ -722,7 +724,7 @@ class CacheFileChecksumMap(object):
          self.file_id_count,
          self.checksum_count) = struct.unpack("<6L", stream.read(24))
 
-        for i in xrange(self.file_id_count):
+        for i in range(self.file_id_count):
             self.entries.append(struct.unpack("<2L", stream.read(8)))
 
         self.checksums = unpack_dword_list(stream, self.checksum_count)
@@ -734,7 +736,7 @@ class CacheFileChecksumMap(object):
         data += [struct.pack("<2L", *i) for i in self.entries]
         data.append(pack_dword_list(self.checksums))
         data.append(self.signature)
-        return "".join(data)
+        return b"".join(data)
 
     def validate(self):
         pass
@@ -742,7 +744,7 @@ class CacheFileChecksumMap(object):
         # if self.owner.directory.file_count != self.item_count:
         #     raise ValueError, "Invalid Cache File Checksum Map [ItemCount and FileCount don't match]"
 
-class CacheFileSectorHeader(object):
+class CacheFileSectorHeader:
 
     def __init__(self, owner):
         self.owner = owner
@@ -762,18 +764,18 @@ class CacheFileSectorHeader(object):
 
     def validate(self):
         if self.application_version != self.owner.header.application_version:
-            raise ValueError, "Invalid Cache File Sector Header [ApplicationVersion mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [ApplicationVersion mismatch]")
         if self.sector_count != self.owner.header.sector_count:
-            raise ValueError, "Invalid Cache File Sector Header [SectorCount mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [SectorCount mismatch]")
         if self.sector_size != self.owner.header.sector_size:
-            raise ValueError, "Invalid Cache File Sector Header [SectorSize mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [SectorSize mismatch]")
         if self.checksum != self.calculate_checksum():
-            raise ValueError, "Invalid Cache File Sector Header [Checksum mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [Checksum mismatch]")
 
     def calculate_checksum(self):
         return self.sector_count + self.sector_size + self.first_sector_offset + self.sectors_used
 
-class CacheFileSector(object):
+class CacheFileSector:
 
     def __init__(self, owner, index):
         self.owner = owner
@@ -796,7 +798,7 @@ class CacheFileSector(object):
 
     next_sector = property(_get_next_sector, _set_next_sector)
 
-class GCFFileStream(object):
+class GCFFileStream:
 
     def __init__(self, entry, owner, mode):
         self.entry = entry
@@ -810,7 +812,7 @@ class GCFFileStream(object):
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         return self.readline()
 
     # File protocol.
@@ -828,7 +830,7 @@ class GCFFileStream(object):
     def seek(self, offset, origin=None):
 
         def err():
-            raise IOError, "Attempting to seek past end of file"
+            raise IOError("Attempting to seek past end of file")
 
         if origin == os.SEEK_SET or origin is None:
             if offset > self.entry.item_size:
@@ -852,22 +854,21 @@ class GCFFileStream(object):
 
         # Our count for the size parameter.
         count = 0
-        # Strings are immutable... use a list
+        # Bytes are immutable... use a list
         chars = []
 
-        lastchar = ""
+        lastchar = b""
 
-        # Loop over our data one character at a time
-        # looking for line breaks
+        # Loop over our data one byte at a time looking for line breaks
         while True:
             lastchar = self.read(1)
             # If we get a CR
-            if lastchar == "\r":
+            if lastchar == b"\r":
                 # Strip out a LF if it comes next
-                if self.read(1) != "\n":
+                if self.read(1) != b"\n":
                     self.position -= 1
                 break
-            elif lastchar == "\n":
+            elif lastchar == b"\n":
                 break
             elif count > size and size > 0:
                 # FIXME: What does the file module do when we have a size
@@ -878,7 +879,10 @@ class GCFFileStream(object):
             # Characters
             chars.append(lastchar)
 
-        return "".join(chars)
+        line = b"".join(chars)
+        if self.is_text_mode():
+            return line.decode('utf-8', errors='replace')
+        return line
 
     def readlines(self, sizehint=-1):
 
@@ -899,23 +903,23 @@ class GCFFileStream(object):
     def read(self, size=0):
 
         if not self.is_read_mode():
-            raise AttributeError, "Cannot read from file with current mode"
+            raise AttributeError("Cannot read from file with current mode")
 
         sector_size = self.owner.data_header.sector_size
         sector_index, offset = divmod(self.position, sector_size)
 
         if not self.sectors:
-            return ""
+            return b""
 
         # Raise an error if we read past end of file.
         if self.position + size > self.entry.item_size:
-            raise IOError, "Attempting to read past end of file"
+            raise IOError("Attempting to read past end of file")
 
         # One file isn't always in just one block.
         # We have to read multiple blocks sometimes in order to get a file.
         read_pos = 0
 
-        # Strings are immutable... use a list.
+        # Bytes are immutable... use a list.
         data = []
 
         if size < 1:
@@ -943,12 +947,11 @@ class GCFFileStream(object):
             read_pos += size
 
         # TYPE CHANGE!
-        # Data - from list to str.
-        data = "".join(data)
+        # Data - from list to bytes.
+        data = b"".join(data)
 
-        # Text mode; strip all \r's
         if self.is_text_mode():
-            data = data.replace("\r", "")
+            return data.decode('utf-8', errors='replace').replace("\r", "")
 
         return data
 
