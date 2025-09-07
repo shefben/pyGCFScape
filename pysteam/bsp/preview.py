@@ -1,9 +1,9 @@
-"""Qt widget capable of rendering a top-down preview of BSP maps.
+"""Qt widget capable of rendering a 3D wireframe preview of BSP maps.
 
-The widget relies on the :mod:`bsp_tool` package to parse both Goldsource and
-Source engine map formats.  Geometry is rendered using simple 2D line drawing
-via :class:`PyQt5.QtGui.QPainter`, providing a lightweight preview that works
-in headless environments and does not require an OpenGL context.
+The widget relies on the optional :mod:`bsp_tool` package to parse map data
+and :mod:`pyqtgraph` for interactive OpenGL rendering.  Users can orbit the
+scene with a mouse drag and zoom using the scroll wheel, providing a minimal
+yet informative overview of the map geometry.
 """
 
 from __future__ import annotations
@@ -12,47 +12,53 @@ import os
 import tempfile
 from typing import List, Sequence, Tuple
 
-from PyQt5.QtCore import QPointF, Qt
-from PyQt5.QtGui import QPainter, QPixmap
-from PyQt5.QtWidgets import (
-    QGraphicsScene,
-    QGraphicsView,
-    QVBoxLayout,
-    QWidget,
-)
+from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from . import detect_engine
 
-try:  # pragma: no cover - optional dependency
-    import bsp_tool
-except Exception:  # pragma: no cover - if unavailable the widget will display an error
+try:  # pragma: no cover - optional dependencies
+    import bsp_tool  # type: ignore
+    import numpy as np
+    import pyqtgraph.opengl as gl
+except Exception:  # pragma: no cover - missing optional deps
     bsp_tool = None  # type: ignore
+    np = None  # type: ignore
+    gl = None  # type: ignore
 
 
 class BSPViewWidget(QWidget):
-    """Widget displaying a very small top-down preview of a BSP map."""
+    """Widget displaying a simple 3D wireframe preview of a BSP map."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.view = _ZoomView()
-        self.scene = QGraphicsScene(self)
-        self.view.setScene(self.scene)
-        layout.addWidget(self.view)
+        if gl is None:
+            self.view: QWidget = QLabel("pyqtgraph module missing")
+            layout.addWidget(self.view)
+        else:
+            self.view = gl.GLViewWidget()
+            self.view.setBackgroundColor("k")
+            layout.addWidget(self.view)
+            self._items: List[gl.GLGraphicsItem] = []
 
     # ------------------------------------------------------------------
     def clear(self) -> None:
-        self.scene.clear()
+        if gl and hasattr(self, "_items"):
+            for item in self._items:
+                self.view.removeItem(item)
+            self._items.clear()
 
     # ------------------------------------------------------------------
     def load_map(self, data: bytes) -> None:
-        """Render ``data`` representing a BSP file into the label."""
+        """Render ``data`` representing a BSP file into the widget."""
 
-        if not bsp_tool:
-            self.label.setText("bsp_tool module missing")
+        if not (bsp_tool and gl and np):
+            if isinstance(self.view, QLabel):
+                self.view.setText("bsp_tool or pyqtgraph missing")
             return
 
+        self.clear()
         engine = detect_engine(data)
         self.view.setToolTip(f"{engine} engine")
 
@@ -70,14 +76,13 @@ class BSPViewWidget(QWidget):
                 pass
 
         # Gather geometry as a list of polygons, each polygon being a sequence
-        # of ``(x, y)`` tuples.  The logic mirrors the approach used by both
-        # reference viewers with minimal abstraction.
+        # of ``(x, y, z)`` tuples.
         vertices: Sequence = bsp.VERTICES
         surf_edges: Sequence[int] = bsp.SURFEDGES
         edges: Sequence[Tuple[int, int]] = bsp.EDGES
         faces: Sequence = bsp.FACES
 
-        polygons: List[List[Tuple[float, float]]] = []
+        polygons: List[List[Tuple[float, float, float]]] = []
         for face in faces:
             start = getattr(face, "first_edge", getattr(face, "firstEdge", 0))
             length = getattr(face, "num_edges", getattr(face, "numEdges", 0))
@@ -89,59 +94,29 @@ class BSPViewWidget(QWidget):
                 else:
                     edge = edges[e_index]
                 indices.append(edge[0])
-            polygon = [(vertices[i].x, vertices[i].y) for i in indices]
-            polygons.append(polygon)
+            polygon = [(vertices[i].x, vertices[i].y, vertices[i].z) for i in indices]
+            if polygon:
+                polygons.append(polygon)
 
         if not polygons:
-            self.scene.clear()
-            self.scene.addText(f"No geometry ({engine})")
+            if isinstance(self.view, QLabel):
+                self.view.setText(f"No geometry ({engine})")
             return
 
-        xs = [x for poly in polygons for x, _ in poly]
-        ys = [y for poly in polygons for _, y in poly]
+        xs = [x for poly in polygons for x, _, _ in poly]
+        ys = [y for poly in polygons for _, y, _ in poly]
+        zs = [z for poly in polygons for _, _, z in poly]
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
-        width = max_x - min_x or 1.0
-        height = max_y - min_y or 1.0
+        min_z, max_z = min(zs), max(zs)
+        center = [(min_x + max_x) / 2, (min_y + max_y) / 2, (min_z + max_z) / 2]
+        size = max(max_x - min_x, max_y - min_y, max_z - min_z) or 1.0
 
-        pixmap = QPixmap(400, 300)
-        pixmap.fill(Qt.black)
-        painter = QPainter(pixmap)
-        painter.setPen(Qt.white)
-        scale = min((pixmap.width() - 20) / width, (pixmap.height() - 20) / height)
+        self.view.opts["center"] = center
+        self.view.opts["distance"] = size * 1.5
+
         for poly in polygons:
-            pts = [
-                QPointF((x - min_x) * scale + 10, (max_y - y) * scale + 10)
-                for x, y in poly
-            ]
-            for i in range(len(pts)):
-                painter.drawLine(pts[i], pts[(i + 1) % len(pts)])
-        painter.end()
-
-        self.scene.clear()
-        self.scene.addPixmap(pixmap)
-        self.view.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
-
-
-class _ZoomView(QGraphicsView):
-    def __init__(self):
-        super().__init__()
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-
-    def wheelEvent(self, event):
-        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
-        self.scale(factor, factor)
-
-    def keyPressEvent(self, event):
-        step = 20
-        if event.key() == Qt.Key_Left:
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - step)
-        elif event.key() == Qt.Key_Right:
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + step)
-        elif event.key() == Qt.Key_Up:
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - step)
-        elif event.key() == Qt.Key_Down:
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() + step)
-        else:
-            super().keyPressEvent(event)
+            pts = np.array(poly + [poly[0]], dtype=float)
+            item = gl.GLLinePlotItem(pos=pts, color=(1, 1, 1, 1), width=1, mode="line_strip")
+            self.view.addItem(item)
+            self._items.append(item)
