@@ -1,6 +1,5 @@
 
 import os
-import pprint
 import struct
 import zlib
 

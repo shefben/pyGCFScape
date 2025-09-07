@@ -69,6 +69,44 @@ def decrypt_gcf_data(data: bytes, key: bytes) -> bytes:
             pos += 8 + comp_size
     return bytes(out)
 
+
+def unpack_dword_list(stream, count):
+    """Return ``count`` little-endian DWORDs from ``stream`` as a list.
+
+    The GCF/NCF formats store many arrays of 32-bit unsigned integers.  Older
+    versions of this project relied on a helper function named
+    ``unpack_dword_list`` to decode these arrays, but the function was missing
+    which resulted in a ``NameError`` at runtime when parsing cache files.
+
+    Parameters
+    ----------
+    stream:
+        A binary file-like object positioned at the start of the array.
+    count:
+        Number of DWORDs to read from the stream.
+
+    Returns
+    -------
+    list[int]
+        The unpacked integers.
+    """
+
+    if count <= 0:
+        return []
+
+    data = stream.read(4 * count)
+    if len(data) != 4 * count:
+        raise ValueError(f"Expected {4 * count} bytes, got {len(data)}")
+    return list(struct.unpack(f"<{count}L", data))
+
+
+def pack_dword_list(values):
+    """Pack an iterable of integers into little-endian DWORD bytes."""
+    values = list(values)
+    if not values:
+        return b""
+    return struct.pack(f"<{len(values)}L", *values)
+
 def raise_parse_error(func):
     def internal(self, *args, **kwargs):
         if not self.is_parsed:
