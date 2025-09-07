@@ -48,7 +48,6 @@ from PyQt5.QtCore import (
     QSettings,
     pyqtSignal,
     QSize,
-    QFileInfo,
     QMimeData,
     QUrl,
 )
@@ -71,7 +70,6 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPlainTextEdit,
-    QFileIconProvider,
     QSplitter,
     QStackedWidget,
     QStatusBar,
@@ -86,6 +84,7 @@ from PyQt5.QtWidgets import (
     QWidget,
     QComboBox,
     QAbstractItemView,
+    QDockWidget,
 )
 
 # The pysteam cache file parser is used to read GCF/NCF archives.  It
@@ -95,9 +94,11 @@ from pysteam.bsp.preview import BSPViewWidget
 from pysteam.image import ImageViewWidget
 from pysteam.vtf.preview import VTFViewWidget
 from pysteam.mdl.preview import MDLViewWidget
+from pysteam.hex.preview import HexViewWidget
 
 
-ICON_PROVIDER = QFileIconProvider()
+# Using standard icons instead of QFileIconProvider avoids expensive
+# SHGetFileInfo calls on large files.
 def is_encrypted(entry) -> bool:
     """Return ``True`` if the manifest flags mark ``entry`` as encrypted."""
 
@@ -137,7 +138,7 @@ class EntryItem(QTreeWidgetItem):
         self.setText(1, size)
         self.setText(2, etype)
         if self.entry.is_file():
-            icon = ICON_PROVIDER.icon(QFileInfo(name))
+            icon = QApplication.style().standardIcon(QStyle.SP_FileIcon)
         else:
             icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
 
@@ -191,7 +192,7 @@ class FileListWidget(QTreeWidget):
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragOnly)
-
+        
     # ------------------------------------------------------------------
     def startDrag(self, supportedActions: Qt.DropActions) -> None:  # type: ignore[override]
         items = [i for i in self.selectedItems() if isinstance(i, EntryItem)]
@@ -222,6 +223,13 @@ class FileListWidget(QTreeWidget):
         drag.setMimeData(mime)
         drag.exec_(Qt.CopyAction)
         self.window._temp_dirs.append(temp_dir)
+
+    # ------------------------------------------------------------------
+    def mousePressEvent(self, event):  # type: ignore[override]
+        index = self.indexAt(event.pos())
+        if index.isValid() and index.column() != 0:
+            return
+        super().mousePressEvent(event)
 
 
 class ExtractionWorker(QThread):
@@ -332,7 +340,7 @@ class PropertiesDialog(QDialog):
 
         icon_label = QLabel()
         if entry.is_file():
-            icon = ICON_PROVIDER.icon(QFileInfo(entry.name))
+            icon = QApplication.style().standardIcon(QStyle.SP_FileIcon)
         else:
             icon = QApplication.style().standardIcon(QStyle.SP_DirIcon)
         if entry.is_file() and entry.name.lower().endswith(".ico"):
@@ -551,11 +559,13 @@ class PreviewWidget(QWidget):
         self.bsp_view = BSPViewWidget()
         self.vtf_view = VTFViewWidget()
         self.mdl_view = MDLViewWidget()
+        self.hex_view = HexViewWidget()
         self.stack.addWidget(self.text_view)
         self.stack.addWidget(self.image_view)
         self.stack.addWidget(self.bsp_view)
         self.stack.addWidget(self.vtf_view)
         self.stack.addWidget(self.mdl_view)
+        self.stack.addWidget(self.hex_view)
         layout.addWidget(self.stack)
 
     # ------------------------------------------------------------------
@@ -565,6 +575,7 @@ class PreviewWidget(QWidget):
         self.bsp_view.clear()
         self.vtf_view.clear()
         self.mdl_view.clear()
+        self.hex_view.clear()
         self.stack.setCurrentWidget(self.text_view)
 
     # ------------------------------------------------------------------
@@ -625,9 +636,8 @@ class PreviewWidget(QWidget):
             self.text_view.setPlainText(text)
             self.stack.setCurrentWidget(self.text_view)
         else:
-            text = " ".join(f"{b:02x}" for b in data)
-            self.text_view.setPlainText(text)
-            self.stack.setCurrentWidget(self.text_view)
+            self.hex_view.load_data(data)
+            self.stack.setCurrentWidget(self.hex_view)
 
     # ------------------------------------------------------------------
     def _request_key(self) -> bytes | None:
@@ -710,7 +720,7 @@ class GCFScapeWindow(QMainWindow):
         self.file_list.itemDoubleClicked.connect(self._file_list_double_clicked)
         self.file_list.setSortingEnabled(True)
         header = self.file_list.header()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         for i in range(3, len(all_columns)):
@@ -745,12 +755,13 @@ class GCFScapeWindow(QMainWindow):
         self.setCentralWidget(main_splitter)
 
         self.preview_widget = PreviewWidget()
-        self.preview_dialog = QDialog(self)
-        self.preview_dialog.setWindowTitle("Preview")
-        self.preview_dialog.resize(600, 400)
-        layout = QVBoxLayout(self.preview_dialog)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.preview_widget)
+        self.preview_dock = QDockWidget("Preview", self)
+        self.preview_dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea
+        )
+        self.preview_dock.setWidget(self.preview_widget)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.preview_dock)
+        self.preview_dock.hide()
 
         # ------------------------------------------------------------------
         # Status bar
@@ -1049,7 +1060,7 @@ class GCFScapeWindow(QMainWindow):
         self.statusBar().showMessage(msg)
         self._log(msg)
         self.preview_widget.clear()
-        self.preview_dialog.hide()
+        self.preview_dock.hide()
 
     def _go_back(self) -> None:
         if self.history_index > 0:
@@ -1067,24 +1078,27 @@ class GCFScapeWindow(QMainWindow):
             self._navigate_to(folder.owner)
 
     def _set_view_mode(self, mode: str) -> None:
+        self.view_mode = mode
         if mode == "details":
             self.file_list.setColumnCount(len(self.column_map))
             self.file_list.setHeaderHidden(False)
+            self.file_list.header().setSectionResizeMode(0, QHeaderView.Interactive)
             for name, idx in self.column_map.items():
                 if idx < 3:
                     self.file_list.setColumnHidden(idx, False)
                 else:
                     action = self.column_actions.get(name)
                     self.file_list.setColumnHidden(idx, not (action and action.isChecked()))
+            self.file_list.setIconSize(QSize(16, 16))
         else:
             self.file_list.setHeaderHidden(True)
             self.file_list.setColumnCount(1)
-        if mode == "large":
-            self.file_list.setIconSize(QSize(64, 64))
-        elif mode == "small":
-            self.file_list.setIconSize(QSize(16, 16))
-        else:
-            self.file_list.setIconSize(QSize(32, 32))
+            if mode == "large":
+                self.file_list.setIconSize(QSize(64, 64))
+            elif mode == "small":
+                self.file_list.setIconSize(QSize(16, 16))
+            else:  # list
+                self.file_list.setIconSize(QSize(32, 32))
 
     def _toggle_column(self, name: str, checked: bool) -> None:
         idx = self.column_map.get(name)
@@ -1094,16 +1108,11 @@ class GCFScapeWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def dragEnterEvent(self, event):  # type: ignore[override]
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+        event.ignore()
 
     # ------------------------------------------------------------------
     def dropEvent(self, event):  # type: ignore[override]
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path:
-                self._load_file(Path(path))
-                break
+        event.ignore()
 
     # ------------------------------------------------------------------
     # Menu building helpers
@@ -1174,7 +1183,7 @@ class GCFScapeWindow(QMainWindow):
         self.tree.clear()
         self.file_list.clear()
         self.preview_widget.clear()
-        self.preview_dialog.hide()
+        self.preview_dock.hide()
         self.statusBar().clearMessage()
         self.entry_to_tree_item.clear()
         self.history.clear()
@@ -1239,7 +1248,7 @@ class GCFScapeWindow(QMainWindow):
             for entry in self._search_results:
                 self.file_list.addTopLevelItem(EntryItem(entry))
             self.preview_widget.clear()
-            self.preview_dialog.hide()
+            self.preview_dock.hide()
             self.address.setText(f"Search results for '{self._search_pattern}'")
             self.statusBar().showMessage(
                 f"Search for '{self._search_pattern}' returned {len(self._search_results)} results."
@@ -1251,7 +1260,7 @@ class GCFScapeWindow(QMainWindow):
         for name, entry in sorted(folder.items.items()):
             self.file_list.addTopLevelItem(EntryItem(entry))
         self.preview_widget.clear()
-        self.preview_dialog.hide()
+        self.preview_dock.hide()
         self.address.setText(folder.path())
         self.statusBar().showMessage(
             f"{_entry_location(folder)} ({len(folder.items)} items)"
@@ -1324,18 +1333,17 @@ class GCFScapeWindow(QMainWindow):
             entry = self._current_entry()
         if not entry or entry.is_folder():
             self.preview_widget.clear()
-            self.preview_dialog.hide()
+            self.preview_dock.hide()
             return
 
         try:
             self.preview_widget.set_entry(entry)
-            self.preview_dialog.show()
+            self.preview_dock.show()
         except Exception as exc:
             self.preview_widget.deleteLater()
             self.preview_widget = PreviewWidget()
-            layout = self.preview_dialog.layout()
-            layout.addWidget(self.preview_widget)
-            self.preview_dialog.hide()
+            self.preview_dock.setWidget(self.preview_widget)
+            self.preview_dock.hide()
             self._log(f"Preview error for {entry.path()}: {exc}")
         self.statusBar().showMessage(_entry_location(entry))
 
