@@ -4,7 +4,7 @@ import pprint
 import struct
 import zlib
 
-from cStringIO import StringIO
+from io import BytesIO
 
 class Blob(object):
     MAGIC = 0x5001
@@ -36,13 +36,13 @@ class Blob(object):
             compressed_bytes = stream.read(compressed_len)
             decompressed_bytes = zlib.decompress(compressed_bytes)
 
-            self.parse(StringIO(decompressed_bytes))
+            self.parse(BytesIO(decompressed_bytes))
 
     def serialize(self, compress=True):
         mode = Blob.COMPRESSED_MAGIC if compress else Blob.MAGIC
-        data = StringIO()
+        data = BytesIO()
 
-        for node in self.children.itervalues():
+        for node in self.children.values():
             data.write(node.serialize())
 
         if compress:
@@ -56,7 +56,7 @@ class Blob(object):
         return len(self.children)
 
     def __iter__(self):
-        return self.children.itervalues()
+        return self.children.values()
 
     def __getitem__(self, key):
         if isinstance(key, int):
@@ -80,7 +80,7 @@ class BlobNode(object):
         magic, = struct.unpack("<H", self.data[:2])
         if magic in (Blob.MAGIC, Blob.COMPRESSED_MAGIC):
             self.child = Blob()
-            self.child.parse(StringIO(self.data))
+            self.child.parse(BytesIO(self.data))
 
     def serialize(self):
         if self.child is not None:

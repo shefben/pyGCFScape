@@ -6,10 +6,8 @@ from pysteam.fs import DirectoryFolder, DirectoryFile, FilesystemPackage
 from math import ceil
 from zlib import adler32
 
-#try:
-from cStringIO import StringIO
-#except ImportError:
-    #from StringIO import StringIO
+# For Python 3 compatibility, use io.BytesIO instead of the removed cStringIO module.
+from io import BytesIO
 
 STEAM_TERMINATOR = "\\" # Hasta la vista, baby.
 
@@ -24,7 +22,7 @@ def pack_dword_list(list):
 def raise_parse_error(func):
     def internal(self, *args, **kwargs):
         if not self.is_parsed:
-            raise ValueError, "Cache file needs to be read first."
+            raise ValueError("Cache file needs to be read first.")
 
         return func(self, *args, **kwargs)
     return internal
@@ -32,7 +30,7 @@ def raise_parse_error(func):
 def raise_ncf_error(func):
     def internal(self, *args, **kwargs):
         if self.is_ncf():
-            raise ValueError, "NCF files do not have contents."
+            raise ValueError("NCF files do not have contents.")
 
         return func(self, *args, **kwargs)
     return internal
@@ -102,7 +100,7 @@ class CacheFile(object):
 
     ## def serialize(self):
 
-    ##     stream = StringIO()
+    ##     stream = BytesIO()
 
     ##     self.header.validate()
     ##     stream.write(self.header.serialize())
@@ -341,22 +339,22 @@ class CacheFileHeader(object):
     def validate(self):
         # Check the usual stuff.
         if self.header_version != 1:
-            raise ValueError, "Invalid Cache File Header [HeaderVersion is not 1]"
+            raise ValueError("Invalid Cache File Header [HeaderVersion is not 1]")
         if not (self.is_ncf() or self.is_gcf()):
-            raise ValueError, "Invalid Cache File Header [Not GCF or NCF]"
+            raise ValueError("Invalid Cache File Header [Not GCF or NCF]")
         if self.is_ncf() and self.format_version != 1:
-            raise ValueError, "Invalid Cache File Header [Is NCF and version is not 1]"
+            raise ValueError("Invalid Cache File Header [Is NCF and version is not 1]")
         elif self.is_gcf() and self.format_version != 6:
-            raise ValueError, "Invalid Cache File Header [Is GCF and version is not 6]"
+            raise ValueError("Invalid Cache File Header [Is GCF and version is not 6]")
         # UPDATE: This fails on some files, namely the half-life files.
         #if self.is_mounted != 0:
         #   raise ValueError, "Invalid Cache File Header [Updating is not 0... WTF?]"
         if self.is_ncf() and self.file_size != 0:
-            raise ValueError, "Invalid Cache File Header [Is NCF and FileSize is not 0]"
+            raise ValueError("Invalid Cache File Header [Is NCF and FileSize is not 0]")
         if self.is_ncf() and self.sector_size != 0:
-            raise ValueError, "Invalid Cache File Header [Is NCF and BlockSize is not 0]"
+            raise ValueError("Invalid Cache File Header [Is NCF and BlockSize is not 0]")
         if self.is_ncf() and self.sector_count != 0:
-            raise ValueError, "Invalid Cache File Header [Is NCF and BlockCount is not 0]"
+            raise ValueError("Invalid Cache File Header [Is NCF and BlockCount is not 0]")
         #if self.checksum != self.calculate_checksum():
         #    raise ValueError, "Invalid Cache File Header [Checksums do not match]"
 
@@ -386,7 +384,7 @@ class CacheFileBlockAllocationTable(object):
         self.checksum = sum(ord(x) for x in stream.read(4))
 
         # Block Entries
-        for i in xrange(self.block_count):
+        for i in range(self.block_count):
             block = CacheFileBlockAllocationTableEntry(self)
             block.index = i
             block.parse(stream)
@@ -402,7 +400,7 @@ class CacheFileBlockAllocationTable(object):
 
     def validate(self):
         if self.owner.header.sector_count != self.block_count:
-            raise ValueError, "Invalid Cache Block [Sector/BlockCounts do not match]"
+            raise ValueError("Invalid Cache Block [Sector/BlockCounts do not match]")
         #print self.checksum, self.calculate_checksum()
         #if self.checksum != self.calculate_checksum():
         #    raise ValueError, "Invalid Cache Block [Checksums do not match]"
@@ -516,9 +514,9 @@ class CacheFileAllocationTable(object):
 
     def validate(self):
         if self.owner.header.sector_count != self.sector_count:
-            raise ValueError, "Invalid Cache Allocation Table [SectorCounts do not match]"
+            raise ValueError("Invalid Cache Allocation Table [SectorCounts do not match]")
         if self.checksum != self.calculate_checksum():
-            raise ValueError, "Invalid Cache Allocation Table [Checksums do not match]"
+            raise ValueError("Invalid Cache Allocation Table [Checksums do not match]")
 
 class CacheFileManifest(object):
 
@@ -561,10 +559,10 @@ class CacheFileManifest(object):
          self.checksum) = struct.unpack("<14L", self.header_data)
 
         # 56 = size of header
-        self.manifest_stream = StringIO(stream.read(self.binary_size-56))
+        self.manifest_stream = BytesIO(stream.read(self.binary_size - 56))
 
         # Manifest Entries
-        for i in xrange(self.node_count):
+        for i in range(self.node_count):
             entry = CacheFileManifestEntry(self)
             entry.index = i
             # 28 = size of ManifestEntry
@@ -630,20 +628,20 @@ class CacheFileManifest(object):
 
     def validate(self):
         if self.owner.header.application_id != self.application_id:
-            raise ValueError, "Invalid Cache File Manifest [Application ID mismatch]"
+            raise ValueError("Invalid Cache File Manifest [Application ID mismatch]")
         if self.owner.header.application_version != self.application_version:
-            raise ValueError, "Invalid Cache File Manifest [Application version mismatch]"
+            raise ValueError("Invalid Cache File Manifest [Application version mismatch]")
         #if self.checksum != self.calculate_checksum():
         #    raise ValueError, "Invalid Cache File Manifest [Checksum mismatch]"
         if self.map_header_version != 1:
-            raise ValueError, "Invalid Cache File Manifest [ManifestHeaderMap's HeaderVersion is not 1]"
+            raise ValueError("Invalid Cache File Manifest [ManifestHeaderMap's HeaderVersion is not 1]")
         if self.map_dummy1 != 0:
-            raise ValueError, "Invalid Cache File Manifest [ManifestHeaderMap's Dummy1 is not 0]"
+            raise ValueError("Invalid Cache File Manifest [ManifestHeaderMap's Dummy1 is not 0]")
 
     def calculate_checksum(self):
         # Blank out checksum and fingerprint + hack to get unsigned value.
         data = self.serialize()
-        return adler32(data[:48] + "\0\0\0\0\0\0\0\0" + data[56:], 0) & 0xffffffffL
+        return adler32(data[:48] + "\0\0\0\0\0\0\0\0" + data[56:], 0) & 0xffffffff
 
 class CacheFileManifestEntry(object):
 
@@ -722,7 +720,7 @@ class CacheFileChecksumMap(object):
          self.file_id_count,
          self.checksum_count) = struct.unpack("<6L", stream.read(24))
 
-        for i in xrange(self.file_id_count):
+        for i in range(self.file_id_count):
             self.entries.append(struct.unpack("<2L", stream.read(8)))
 
         self.checksums = unpack_dword_list(stream, self.checksum_count)
@@ -762,13 +760,13 @@ class CacheFileSectorHeader(object):
 
     def validate(self):
         if self.application_version != self.owner.header.application_version:
-            raise ValueError, "Invalid Cache File Sector Header [ApplicationVersion mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [ApplicationVersion mismatch]")
         if self.sector_count != self.owner.header.sector_count:
-            raise ValueError, "Invalid Cache File Sector Header [SectorCount mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [SectorCount mismatch]")
         if self.sector_size != self.owner.header.sector_size:
-            raise ValueError, "Invalid Cache File Sector Header [SectorSize mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [SectorSize mismatch]")
         if self.checksum != self.calculate_checksum():
-            raise ValueError, "Invalid Cache File Sector Header [Checksum mismatch]"
+            raise ValueError("Invalid Cache File Sector Header [Checksum mismatch]")
 
     def calculate_checksum(self):
         return self.sector_count + self.sector_size + self.first_sector_offset + self.sectors_used
@@ -828,7 +826,7 @@ class GCFFileStream(object):
     def seek(self, offset, origin=None):
 
         def err():
-            raise IOError, "Attempting to seek past end of file"
+            raise IOError("Attempting to seek past end of file")
 
         if origin == os.SEEK_SET or origin is None:
             if offset > self.entry.item_size:
@@ -899,7 +897,7 @@ class GCFFileStream(object):
     def read(self, size=0):
 
         if not self.is_read_mode():
-            raise AttributeError, "Cannot read from file with current mode"
+            raise AttributeError("Cannot read from file with current mode")
 
         sector_size = self.owner.data_header.sector_size
         sector_index, offset = divmod(self.position, sector_size)
@@ -909,7 +907,7 @@ class GCFFileStream(object):
 
         # Raise an error if we read past end of file.
         if self.position + size > self.entry.item_size:
-            raise IOError, "Attempting to read past end of file"
+            raise IOError("Attempting to read past end of file")
 
         # One file isn't always in just one block.
         # We have to read multiple blocks sometimes in order to get a file.

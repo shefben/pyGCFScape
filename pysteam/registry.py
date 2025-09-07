@@ -54,7 +54,7 @@ class RegistryKey(object):
         return repr(self.items)
 
     def __iter__(self):
-        return self.items.itervalues()
+        return self.items.values()
 
 class RegistryValue(object):
 
