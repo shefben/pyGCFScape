@@ -12,6 +12,7 @@ import os
 import tempfile
 from typing import List, Sequence, Tuple
 
+from PyQt5.QtGui import QVector3D
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from . import detect_engine
@@ -31,8 +32,15 @@ except Exception:  # pragma: no cover - missing optional deps
 
 try:  # pragma: no cover - optional dependencies
     import pyqtgraph.opengl as gl  # type: ignore
+    _gl_missing_dep: str | None = None
+except ModuleNotFoundError as exc:  # pragma: no cover - missing optional deps
+    gl = None  # type: ignore
+    # ``pyqtgraph.opengl`` depends on ``PyOpenGL``.  Distinguish between the
+    # two so the user gets a helpful message about which package they need.
+    _gl_missing_dep = "PyOpenGL" if exc.name == "OpenGL" else "pyqtgraph"
 except Exception:  # pragma: no cover - missing optional deps
     gl = None  # type: ignore
+    _gl_missing_dep = "pyqtgraph"
 
 
 class BSPViewWidget(QWidget):
@@ -43,7 +51,8 @@ class BSPViewWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         if gl is None:
-            self.view: QWidget = QLabel("pyqtgraph module missing")
+            missing = _gl_missing_dep or "pyqtgraph"
+            self.view: QWidget = QLabel(f"{missing} module missing")
             layout.addWidget(self.view)
         else:
             self.view = gl.GLViewWidget()
@@ -68,7 +77,8 @@ class BSPViewWidget(QWidget):
             return
         if not gl:
             if isinstance(self.view, QLabel):
-                self.view.setText("pyqtgraph module missing")
+                missing = _gl_missing_dep or "pyqtgraph"
+                self.view.setText(f"{missing} module missing")
             return
         if not np:
             if isinstance(self.view, QLabel):
@@ -126,7 +136,11 @@ class BSPViewWidget(QWidget):
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
         min_z, max_z = min(zs), max(zs)
-        center = [(min_x + max_x) / 2, (min_y + max_y) / 2, (min_z + max_z) / 2]
+        center = QVector3D(
+            (min_x + max_x) / 2,
+            (min_y + max_y) / 2,
+            (min_z + max_z) / 2,
+        )
         size = max(max_x - min_x, max_y - min_y, max_z - min_z) or 1.0
 
         self.view.opts["center"] = center
