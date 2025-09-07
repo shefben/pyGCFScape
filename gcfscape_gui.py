@@ -46,7 +46,7 @@ from PyQt5.QtCore import (
     pyqtSignal,
     QSize,
 )
-from PyQt5.QtGui import QIcon, QFont, QCloseEvent
+from PyQt5.QtGui import QIcon, QFont, QCloseEvent, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -126,6 +126,15 @@ class EntryItem(QTreeWidgetItem):
         icon = QApplication.style().standardIcon(
             QStyle.SP_FileIcon if self.entry.is_file() else QStyle.SP_DirIcon
         )
+        if self.entry.is_file() and name.lower().endswith(".ico"):
+            try:
+                stream = self.entry.open("rb")
+                data = stream.readall()
+                pix = QPixmap()
+                if pix.loadFromData(data):
+                    icon = QIcon(pix)
+            except Exception:
+                pass
         self.setIcon(0, icon)
 
     # ------------------------------------------------------------------
@@ -179,18 +188,189 @@ class ExtractionWorker(QThread):
         self._cancelled = True
 
 
-class PropertiesDialog(QDialog):
-    """Dialog showing information about a file or folder entry."""
+def _format_bytes(value: int) -> str:
+    gb = value / (1024 ** 3)
+    mb = value / (1024 ** 2)
+    kb = value / 1024
+    return f"{gb:.2f} GB / {mb:.2f} MB / {kb:.2f} KB / {value} bytes"
 
-    def __init__(self, entry, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Properties")
-        layout = QFormLayout(self)
-        layout.addRow("Path:", QLabel(entry.path()))
-        if entry.is_file():
-            layout.addRow("Size:", QLabel(str(entry.size())))
+
+def _count_items(folder) -> tuple[int, int]:
+    files = 0
+    folders = 0
+    for item in folder:
+        if item.is_file():
+            files += 1
         else:
-            layout.addRow("Items:", QLabel(str(len(entry.items))))
+            f, d = _count_items(item)
+            files += f
+            folders += d + 1
+    return files, folders
+
+
+def _completion(entry) -> float:
+    if entry.is_file():
+        total = entry.size()
+        manifest = getattr(entry, "_manifest_entry", None)
+        if not manifest or total == 0:
+            return 100.0
+        avail = sum(b.file_data_size for b in manifest.blocks if b)
+        return 100.0 * min(1.0, avail / total)
+    files = entry.all_files()
+    total = sum(f.size() for f in files)
+    if total == 0:
+        return 100.0
+    avail = 0
+    for f in files:
+        manifest = getattr(f, "_manifest_entry", None)
+        if manifest:
+            avail += sum(b.file_data_size for b in manifest.blocks if b)
+    return 100.0 * min(1.0, avail / total)
+
+
+class PropertiesDialog(QDialog):
+    """Dialog showing detailed information about an entry."""
+
+    def __init__(self, entry, window, parent: QWidget | None = None) -> None:
+        super().__init__(parent or window)
+        self.entry = entry
+        self.window = window
+        self.cache = window.cachefile
+        self.setWindowTitle("Properties")
+
+        layout = QVBoxLayout(self)
+        header = QHBoxLayout()
+
+        icon_label = QLabel()
+        icon = QApplication.style().standardIcon(
+            QStyle.SP_FileIcon if entry.is_file() else QStyle.SP_DirIcon
+        )
+        if entry.is_file() and entry.name.lower().endswith(".ico"):
+            try:
+                stream = entry.open("rb")
+                data = stream.readall()
+                pix = QPixmap()
+                if pix.loadFromData(data):
+                    icon = QIcon(pix)
+            except Exception:
+                pass
+        icon_label.setPixmap(icon.pixmap(48, 48))
+        name = entry.name or getattr(self.cache, "filename", "")
+        header.addWidget(icon_label)
+        header.addWidget(QLabel(name))
+        layout.addLayout(header)
+
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        if self.cache and entry is self.cache.root:
+            form.addRow("Item type:", QLabel("Cache"))
+            location = str(self.window.current_path or "")
+            form.addRow("Location:", QLabel(location))
+            form.addRow("Size:", QLabel(_format_bytes(entry.size())))
+            blocks_used = self.cache.blocks.blocks_used if self.cache.blocks else 0
+            sector_size = self.cache.header.sector_size
+            form.addRow(
+                "Size on disk:",
+                QLabel(_format_bytes(blocks_used * sector_size)),
+            )
+            files, folders = _count_items(entry)
+            form.addRow(
+                "Contains:",
+                QLabel(f"{files + folders} items, {folders} folders"),
+            )
+            form.addRow(
+                "Percent complete:", QLabel(f"{_completion(entry):.0f}%")
+            )
+            header = self.cache.header
+            form.addRow("GCF version:", QLabel(str(header.format_version)))
+            form.addRow("Cache ID:", QLabel(str(header.application_id)))
+            if self.cache.blocks:
+                form.addRow(
+                    "Allocated blocks:", QLabel(str(self.cache.blocks.block_count))
+                )
+                form.addRow(
+                    "Used blocks:", QLabel(str(self.cache.blocks.blocks_used))
+                )
+            form.addRow("Block length:", QLabel(str(header.sector_size)))
+            form.addRow(
+                "Last played version:", QLabel(str(header.application_version))
+            )
+            if self.cache.alloc_table:
+                allocs = self.cache.alloc_table.sector_count
+                form.addRow("Total mapping allocations:", QLabel(str(allocs)))
+                form.addRow(
+                    "Total mapping memory allocated:",
+                    QLabel(_format_bytes(allocs * sector_size)),
+                )
+                form.addRow(
+                    "Total mapping memory used:",
+                    QLabel(_format_bytes(blocks_used * sector_size)),
+                )
+            flags = getattr(self.cache.manifest, "depot_info", 0)
+            form.addRow("Flags:", QLabel(hex(flags)))
+            form.addRow(
+                "Fragmented:",
+                QLabel("Yes" if self.cache.is_fragmented() else "No"),
+            )
+        elif entry.is_folder():
+            form.addRow("Item type:", QLabel("Folder"))
+            form.addRow("Location:", QLabel(entry.path()))
+            form.addRow("Size:", QLabel(_format_bytes(entry.size())))
+            files, folders = _count_items(entry)
+            form.addRow(
+                "Contains:",
+                QLabel(f"{files + folders} items, {folders} folders"),
+            )
+            sector = self.cache.header.sector_size if self.cache else 0
+            size_on_disk = (
+                sum(getattr(f, "num_of_blocks", 0) for f in entry.all_files())
+                * sector
+            )
+            form.addRow("Size on disk:", QLabel(_format_bytes(size_on_disk)))
+            form.addRow(
+                "Total file completion:",
+                QLabel(f"{_completion(entry):.0f}%"),
+            )
+            flags = getattr(getattr(entry, "_manifest_entry", None), "directory_flags", 0)
+            form.addRow("Flags:", QLabel(hex(flags)))
+            frag = any(getattr(f, "is_fragmented", False) for f in entry.all_files())
+            form.addRow("Fragmented:", QLabel("Yes" if frag else "No"))
+        else:
+            form.addRow("Item type:", QLabel("File"))
+            form.addRow("Location:", QLabel(entry.path()))
+            form.addRow("Size:", QLabel(_format_bytes(entry.size())))
+            sector = self.cache.header.sector_size if self.cache else 0
+            blocks = getattr(entry, "num_of_blocks", 0)
+            form.addRow(
+                "Size on disk:", QLabel(_format_bytes(blocks * sector))
+            )
+            comp = _completion(entry)
+            form.addRow("Extractable:", QLabel("True" if comp >= 100 else "False"))
+            form.addRow("Completion:", QLabel(f"{comp:.0f}%"))
+            manifest = getattr(entry, "_manifest_entry", None)
+            flags = manifest.directory_flags if manifest else 0
+            form.addRow(
+                "Is encrypted:",
+                QLabel(str(bool(flags & CacheFileManifestEntry.FLAG_IS_ENCRYPTED))),
+            )
+            form.addRow(
+                "Copy locally:",
+                QLabel(str(bool(flags & CacheFileManifestEntry.FLAG_IS_NO_CACHE))),
+            )
+            form.addRow(
+                "Overwrite local copy:",
+                QLabel(str(bool(flags & CacheFileManifestEntry.FLAG_IS_LOCKED))),
+            )
+            form.addRow(
+                "Backup local copy:",
+                QLabel(str(bool(flags & CacheFileManifestEntry.FLAG_BACKUP_PLZ))),
+            )
+            form.addRow("Flags:", QLabel(hex(flags)))
+            form.addRow(
+                "Fragmented:",
+                QLabel("Yes" if getattr(entry, "is_fragmented", False) else "No"),
+            )
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok)
         buttons.accepted.connect(self.accept)
@@ -379,6 +559,7 @@ class GCFScapeWindow(QMainWindow):
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._open_context_menu)
         self.tree.itemSelectionChanged.connect(self._update_file_list)
+        self.tree.itemSelectionChanged.connect(self._update_preview)
         left_layout.addWidget(self.tree)
 
         right_splitter = QSplitter(Qt.Vertical)
