@@ -57,8 +57,6 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -71,6 +69,7 @@ from PyQt5.QtWidgets import (
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -109,6 +108,10 @@ class EntryItem(QTreeWidgetItem):
         self.setText(0, name)
         self.setText(1, size)
         self.setText(2, etype)
+        icon = QApplication.style().standardIcon(
+            QStyle.SP_FileIcon if self.entry.is_file() else QStyle.SP_DirIcon
+        )
+        self.setIcon(0, icon)
 
     # ------------------------------------------------------------------
     def path(self) -> str:
@@ -259,6 +262,7 @@ class GCFScapeWindow(QMainWindow):
 
         self.cachefile: CacheFile | None = None
         self.current_path: Path | None = None
+        self.entry_to_tree_item: dict = {}
 
         # ------------------------------------------------------------------
         # Central layout
@@ -275,17 +279,31 @@ class GCFScapeWindow(QMainWindow):
         left_layout.addWidget(self.search)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Name", "Size", "Type"])
+        self.tree.setHeaderHidden(True)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._open_context_menu)
-        self.tree.itemSelectionChanged.connect(self._update_preview)
+        self.tree.itemSelectionChanged.connect(self._update_file_list)
         left_layout.addWidget(self.tree)
 
+        right_splitter = QSplitter(Qt.Vertical)
+        self.file_list = QTreeWidget()
+        self.file_list.setHeaderLabels(["Name", "Size", "Type"])
+        self.file_list.setRootIsDecorated(False)
+        self.file_list.setItemsExpandable(False)
+        self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_list.customContextMenuRequested.connect(self._open_context_menu)
+        self.file_list.itemSelectionChanged.connect(self._update_preview)
+        self.file_list.itemDoubleClicked.connect(self._file_list_double_clicked)
+        right_splitter.addWidget(self.file_list)
+
         self.preview = PreviewWidget()
+        right_splitter.addWidget(self.preview)
+        right_splitter.setStretchFactor(0, 3)
+        right_splitter.setStretchFactor(1, 1)
 
         splitter.addWidget(left_widget)
-        splitter.addWidget(self.preview)
-        splitter.setStretchFactor(0, 3)
+        splitter.addWidget(right_splitter)
+        splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         self.setCentralWidget(splitter)
 
@@ -400,7 +418,9 @@ class GCFScapeWindow(QMainWindow):
 
     def _current_entry(self):
         """Return the entry associated with the current selection."""
-
+        item = self.file_list.currentItem()
+        if isinstance(item, EntryItem):
+            return item.entry
         item = self.tree.currentItem()
         if isinstance(item, EntryItem):
             return item.entry
@@ -479,8 +499,10 @@ class GCFScapeWindow(QMainWindow):
         self.cachefile = None
         self.current_path = None
         self.tree.clear()
+        self.file_list.clear()
         self.preview.clear()
         self.statusBar().clearMessage()
+        self.entry_to_tree_item.clear()
 
     # ------------------------------------------------------------------
     def _refresh(self) -> None:
@@ -493,19 +515,50 @@ class GCFScapeWindow(QMainWindow):
 
     def _populate_tree(self) -> None:
         self.tree.clear()
+        self.file_list.clear()
+        self.entry_to_tree_item.clear()
         if not self.cachefile:
             return
 
-        def add_entries(folder, parent_item):
-            for name, entry in sorted(folder.items.items()):
-                item = EntryItem(entry)
-                parent_item.addChild(item)
-                if entry.is_folder():
-                    add_entries(entry, item)
+        root_entry = self.cachefile.root
+        root_item = EntryItem(root_entry)
+        self.tree.addTopLevelItem(root_item)
+        self.entry_to_tree_item[root_entry] = root_item
 
-        add_entries(self.cachefile.root, self.tree.invisibleRootItem())
-        self.tree.expandToDepth(0)
+        def add_dirs(folder, parent_item):
+            for name, entry in sorted(folder.items.items()):
+                if entry.is_folder():
+                    item = EntryItem(entry)
+                    parent_item.addChild(item)
+                    self.entry_to_tree_item[entry] = item
+                    add_dirs(entry, item)
+
+        add_dirs(root_entry, root_item)
+        self.tree.setCurrentItem(root_item)
+        self._update_file_list()
+        self.tree.collapseAll()
         self._filter_tree(self.search.text())
+
+    def _current_directory(self):
+        item = self.tree.currentItem()
+        if isinstance(item, EntryItem):
+            return item.entry
+        return None
+
+    def _update_file_list(self) -> None:
+        self.file_list.clear()
+        folder = self._current_directory()
+        if not folder:
+            return
+        for name, entry in sorted(folder.items.items()):
+            self.file_list.addTopLevelItem(EntryItem(entry))
+        self.preview.clear()
+
+    def _file_list_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        if isinstance(item, EntryItem) and item.entry.is_folder():
+            tree_item = self.entry_to_tree_item.get(item.entry)
+            if tree_item:
+                self.tree.setCurrentItem(tree_item)
 
     # ------------------------------------------------------------------
     def _filter_tree(self, text: str) -> None:
@@ -548,7 +601,8 @@ class GCFScapeWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _open_context_menu(self, pos) -> None:
-        item = self.tree.itemAt(pos)
+        widget = self.sender()
+        item = widget.itemAt(pos) if isinstance(widget, QTreeWidget) else None
         if not isinstance(item, EntryItem):
             return
 
@@ -572,7 +626,9 @@ class GCFScapeWindow(QMainWindow):
         props_action.triggered.connect(lambda: self._show_properties(entry))
         menu.addAction(props_action)
 
-        menu.exec(self.tree.viewport().mapToGlobal(pos))
+        viewport = widget.viewport() if isinstance(widget, QTreeWidget) else None
+        if viewport:
+            menu.exec(viewport.mapToGlobal(pos))
 
     # ------------------------------------------------------------------
     def _extract_all(self) -> None:
