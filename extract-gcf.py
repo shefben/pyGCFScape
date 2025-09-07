@@ -1,18 +1,35 @@
 
-from pysteam.fs.cachefile import CacheFile
-from optparse import OptionParser
-
-parser = OptionParser()
-parser.add_option("-m", "--minimum", action="store_true", dest="minimum", help="Extract minimum footprint only?")
-parser.add_option("-o", "--output", dest="output", help="Output directory for extraction.")
-options, args = parser.parse_args()
-
-cacheHandle = open(args[0],"rb")
-cacheFile = CacheFile.parse(cacheHandle)
-
+import argparse
 import os.path
-if options.minimum:
-    cacheFile.extract_minimum_footprint(os.path.realpath(options.output))
-else:
-    cacheFile.extract(os.path.realpath(options.output))
-cacheHandle.close()
+
+from pysteam.fs.cachefile import CacheFile
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Extract files from a Steam cache")
+    parser.add_argument("cachefile", help="Path to the cache file to extract")
+    parser.add_argument(
+        "-m",
+        "--minimum",
+        action="store_true",
+        help="Extract minimum footprint only",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="Output directory for extraction",
+    )
+    args = parser.parse_args()
+
+    with open(args.cachefile, "rb") as cache_handle:
+        cache_file = CacheFile.parse(cache_handle)
+        output_dir = os.path.realpath(args.output)
+        if args.minimum:
+            cache_file.extract_minimum_footprint(output_dir)
+        else:
+            cache_file.extract(output_dir)
+
+
+if __name__ == "__main__":
+    main()
