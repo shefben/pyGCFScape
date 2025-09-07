@@ -609,7 +609,7 @@ class GCFScapeWindow(QMainWindow):
             return
 
         self.preview.set_entry(entry)
-
+        
     # ------------------------------------------------------------------
     # Context menu and actions
     # ------------------------------------------------------------------
