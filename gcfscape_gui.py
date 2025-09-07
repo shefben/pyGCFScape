@@ -50,8 +50,10 @@ from PyQt5.QtCore import (
     QSize,
     QMimeData,
     QUrl,
+    QModelIndex,
+    QPoint,
 )
-from PyQt5.QtGui import QIcon, QCloseEvent, QPixmap, QDesktopServices, QDrag
+from PyQt5.QtGui import QIcon, QCloseEvent, QPixmap, QDesktopServices, QDrag, QMouseEvent
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -190,6 +192,7 @@ class FileListWidget(QTreeWidget):
         super().__init__()
         self.window = window
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragOnly)
         
@@ -226,9 +229,19 @@ class FileListWidget(QTreeWidget):
 
     # ------------------------------------------------------------------
     def mousePressEvent(self, event):  # type: ignore[override]
-        index = self.indexAt(event.pos())
-        if index.isValid() and index.column() != 0:
-            return
+        if self.window.view_mode in ("details", "list"):
+            index = self.indexAt(event.pos())
+            if index.isValid() and index.column() != 0:
+                fake = QMouseEvent(
+                    event.type(),
+                    QPoint(-1, -1),
+                    event.globalPos(),
+                    event.button(),
+                    event.buttons(),
+                    event.modifiers(),
+                )
+                super().mousePressEvent(fake)
+                return
         super().mousePressEvent(event)
 
 
@@ -1261,7 +1274,10 @@ class GCFScapeWindow(QMainWindow):
             self.file_list.addTopLevelItem(EntryItem(entry))
         self.preview_widget.clear()
         self.preview_dock.hide()
-        self.address.setText(folder.path())
+        path = folder.path().replace("/", "\\")
+        if not path.startswith("root\\"):
+            path = "root\\" + path.lstrip("\\")
+        self.address.setText(path)
         self.statusBar().showMessage(
             f"{_entry_location(folder)} ({len(folder.items)} items)"
         )
