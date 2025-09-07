@@ -55,6 +55,7 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -66,10 +67,12 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStatusBar,
+    QCheckBox,
     QTextEdit,
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
+    QInputDialog,
     QStyle,
     QVBoxLayout,
     QWidget,
@@ -77,8 +80,18 @@ from PyQt5.QtWidgets import (
 
 # The pysteam cache file parser is used to read GCF/NCF archives.  It
 # exposes a similar API to the original C++ version used by GCFScape.
-from pysteam.fs.cachefile import CacheFile
+from pysteam.fs.cachefile import CacheFile, CacheFileManifestEntry
 from pysteam.bsp.preview import BSPViewWidget
+from pysteam.image import ImageViewWidget
+from pysteam.vtf.preview import VTFViewWidget
+from pysteam.mdl.preview import MDLViewWidget
+def is_encrypted(entry) -> bool:
+    """Return ``True`` if the manifest flags mark ``entry`` as encrypted."""
+
+    manifest = getattr(entry, "_manifest_entry", None)
+    if not manifest:
+        return False
+    return bool(manifest.directory_flags & CacheFileManifestEntry.FLAG_IS_ENCRYPTED)
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +145,17 @@ class ExtractionWorker(QThread):
     finished = pyqtSignal()
     error = pyqtSignal(str)
 
-    def __init__(self, files: Iterable, dest: str, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        files: Iterable,
+        dest: str,
+        key: bytes | None = None,
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent)
         self.files = list(files)
         self.dest = dest
+        self.key = key
         self._cancelled = False
 
     # ------------------------------------------------------------------
@@ -146,7 +166,9 @@ class ExtractionWorker(QThread):
                 break
             try:
                 self.progress.emit(int(idx / total * 100), entry.path())
-                entry.extract(self.dest, keep_folder_structure=True)
+                if is_encrypted(entry) and self.key is None:
+                    raise ValueError("File is encrypted but no key was provided")
+                entry.extract(self.dest, keep_folder_structure=True, key=self.key)
             except Exception as exc:  # pragma: no cover - worker thread
                 self.error.emit(str(exc))
                 return
@@ -197,28 +219,36 @@ class SearchDialog(QDialog):
 class OptionsDialog(QDialog):
     """Very small placeholder for application options.
 
-    The real GCFScape exposes a complex options dialog for tuning the
-    application.  For the purposes of this demonstration a simple placeholder
-    is provided to maintain UI parity.  The dialog exposes a single checkbox
-    that toggles the preview pane visibility on start-up.  The state is stored
-    via :class:`QSettings` so that it persists across launches."""
+    Only a tiny subset of the original tool's preferences are implemented.
+    Currently a single checkbox allows toggling the preview pane visibility on
+    application start-up.  The value is persisted via :class:`QSettings`.
+    """
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.settings = settings
         self.setWindowTitle("Options")
         self.resize(300, 120)
 
         layout = QVBoxLayout(self)
-        form = QFormLayout()
-        self.start_preview = QLineEdit()
-        self.start_preview.setText("on")
-        form.addRow("Preview at startup:", self.start_preview)
-        layout.addLayout(form)
+        self.preview_check = QCheckBox("Show preview at startup")
+        self.preview_check.setChecked(self.settings.value("preview", True, bool))
+        layout.addWidget(self.preview_check)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    # ------------------------------------------------------------------
+    @property
+    def preview_enabled(self) -> bool:
+        return self.preview_check.isChecked()
+
+    # ------------------------------------------------------------------
+    def accept(self) -> None:  # type: ignore[override]
+        self.settings.setValue("preview", self.preview_check.isChecked())
+        super().accept()
 
 
 class PreviewWidget(QWidget):
@@ -230,15 +260,24 @@ class PreviewWidget(QWidget):
         self.stack = QStackedWidget()
         self.text_view = QTextEdit()
         self.text_view.setReadOnly(True)
+        self.image_view = ImageViewWidget()
         self.bsp_view = BSPViewWidget()
+        self.vtf_view = VTFViewWidget()
+        self.mdl_view = MDLViewWidget()
         self.stack.addWidget(self.text_view)
+        self.stack.addWidget(self.image_view)
         self.stack.addWidget(self.bsp_view)
+        self.stack.addWidget(self.vtf_view)
+        self.stack.addWidget(self.mdl_view)
         layout.addWidget(self.stack)
 
     # ------------------------------------------------------------------
     def clear(self) -> None:
         self.text_view.clear()
+        self.image_view.clear()
         self.bsp_view.clear()
+        self.vtf_view.clear()
+        self.mdl_view.clear()
         self.stack.setCurrentWidget(self.text_view)
 
     # ------------------------------------------------------------------
@@ -246,22 +285,59 @@ class PreviewWidget(QWidget):
         """Display a preview for ``entry`` which may be a BSP or text file."""
 
         name = entry.name.lower()
+        ext = os.path.splitext(name)[1]
+        key = None
+        if is_encrypted(entry):
+            key = self._request_key()
+            if key is None:
+                self.clear()
+                return
+
         try:
-            data = entry.read()
+            stream = entry.open("rb", key=key)
+            data = stream.readall()
         except Exception:
             self.clear()
             return
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
 
-        if name.endswith(".bsp"):
+        IMAGE_EXTS = {".gif", ".jpg", ".jpeg", ".bmp", ".png", ".tga", ".ico"}
+        TEXT_EXTS = {".res", ".txt", ".vmt", ".lst", ".xml", ".vdf", ".html"}
+
+        if ext == ".bsp":
             self.bsp_view.load_map(data)
             self.stack.setCurrentWidget(self.bsp_view)
-        else:
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                text = " ".join(f"{b:02x}" for b in data)
+        elif ext == ".vtf":
+            self.vtf_view.load_vtf(data)
+            self.stack.setCurrentWidget(self.vtf_view)
+        elif ext == ".mdl":
+            self.mdl_view.load_model(data)
+            self.stack.setCurrentWidget(self.mdl_view)
+        elif ext in IMAGE_EXTS:
+            self.image_view.load_image(data)
+            self.stack.setCurrentWidget(self.image_view)
+        elif ext in TEXT_EXTS:
+            text = data.decode("utf-8", errors="replace")
             self.text_view.setPlainText(text)
             self.stack.setCurrentWidget(self.text_view)
+        else:
+            text = " ".join(f"{b:02x}" for b in data)
+            self.text_view.setPlainText(text)
+            self.stack.setCurrentWidget(self.text_view)
+
+    # ------------------------------------------------------------------
+    def _request_key(self) -> bytes | None:
+        text, ok = QInputDialog.getText(self, "Encrypted file", "Enter decryption key:")
+        if not ok or not text:
+            return None
+        try:
+            return bytes.fromhex(text)
+        except ValueError:
+            return text.encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -314,12 +390,19 @@ class GCFScapeWindow(QMainWindow):
         self.file_list.customContextMenuRequested.connect(self._open_context_menu)
         self.file_list.itemSelectionChanged.connect(self._update_preview)
         self.file_list.itemDoubleClicked.connect(self._file_list_double_clicked)
+        self.file_list.setSortingEnabled(True)
+        header = self.file_list.header()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         right_splitter.addWidget(self.file_list)
 
         self.preview = PreviewWidget()
         right_splitter.addWidget(self.preview)
         right_splitter.setStretchFactor(0, 3)
         right_splitter.setStretchFactor(1, 1)
+        show_preview = self.settings.value("preview", True, bool)
+        self.preview.setVisible(show_preview)
 
         splitter.addWidget(left_widget)
         splitter.addWidget(right_splitter)
@@ -362,6 +445,9 @@ class GCFScapeWindow(QMainWindow):
         self.properties_action = QAction("Properties", self)
         self.properties_action.triggered.connect(lambda: self._show_properties(self._current_entry()))
 
+        self.preview_toggle_action = QAction("Show Preview", self, checkable=True, checked=show_preview)
+        self.preview_toggle_action.toggled.connect(lambda checked: (self.preview.setVisible(checked), self.settings.setValue("preview", checked)))
+
         self.find_action = QAction("&Find…", self)
         self.find_action.triggered.connect(self._open_search_dialog)
 
@@ -370,6 +456,12 @@ class GCFScapeWindow(QMainWindow):
 
         self.validate_action = QAction("&Validate", self)
         self.validate_action.triggered.connect(self._validate)
+
+        self.convert_v1_action = QAction("Convert to &V1…", self)
+        self.convert_v1_action.triggered.connect(lambda: self._convert_gcf(1))
+
+        self.convert_latest_action = QAction("Convert to &Latest…", self)
+        self.convert_latest_action.triggered.connect(lambda: self._convert_gcf(6))
 
         self.options_action = QAction("&Options…", self)
         self.options_action.triggered.connect(self._open_options)
@@ -404,10 +496,13 @@ class GCFScapeWindow(QMainWindow):
         view_menu = menubar.addMenu("&View")
         view_menu.addAction(self.expand_action)
         view_menu.addAction(self.collapse_action)
+        view_menu.addAction(self.preview_toggle_action)
 
         tools_menu = menubar.addMenu("&Tools")
         tools_menu.addAction(self.defrag_action)
         tools_menu.addAction(self.validate_action)
+        tools_menu.addAction(self.convert_v1_action)
+        tools_menu.addAction(self.convert_latest_action)
         tools_menu.addSeparator()
         tools_menu.addAction(self.options_action)
 
@@ -542,6 +637,7 @@ class GCFScapeWindow(QMainWindow):
 
         root_entry = self.cachefile.root
         root_item = EntryItem(root_entry)
+        root_item.setText(0, "root")
         self.tree.addTopLevelItem(root_item)
         self.entry_to_tree_item[root_entry] = root_item
 
@@ -573,6 +669,7 @@ class GCFScapeWindow(QMainWindow):
         for name, entry in sorted(folder.items.items()):
             self.file_list.addTopLevelItem(EntryItem(entry))
         self.preview.clear()
+        self.statusBar().showMessage(f"{folder.path()} ({len(folder.items)} items)")
 
     def _file_list_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         if isinstance(item, EntryItem) and item.entry.is_folder():
@@ -609,7 +706,8 @@ class GCFScapeWindow(QMainWindow):
             return
 
         self.preview.set_entry(entry)
-        
+        self.statusBar().showMessage(entry.path())
+
     # ------------------------------------------------------------------
     # Context menu and actions
     # ------------------------------------------------------------------
@@ -663,7 +761,17 @@ class GCFScapeWindow(QMainWindow):
         else:
             files = entry.all_files()
 
-        worker = ExtractionWorker(files, dest, self)
+        key = None
+        if any(is_encrypted(f) for f in files):
+            text, ok = QInputDialog.getText(self, "Encrypted file", "Enter decryption key:")
+            if not ok or not text:
+                return
+            try:
+                key = bytes.fromhex(text)
+            except ValueError:
+                key = text.encode("utf-8")
+
+        worker = ExtractionWorker(files, dest, key, self)
         progress = QProgressDialog("Extracting…", "Cancel", 0, 100, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.canceled.connect(worker.cancel)
@@ -694,32 +802,73 @@ class GCFScapeWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _defragment(self) -> None:
-        """Placeholder defragmentation action."""
+        """Run a lightweight fragmentation check.
+
+        The Python port does not currently support rewriting cache files, but
+        we mimic the behaviour of GCFScape by informing the user whether the
+        archive appears fragmented.
+        """
 
         if not self.cachefile:
             return
-        QMessageBox.information(
+
+        if not self.cachefile.is_fragmented():
+            QMessageBox.information(self, "Defragment", "Archive is already defragmented.")
+            return
+
+        QMessageBox.warning(
             self,
             "Defragment",
-            "Defragmentation is not implemented in this demonstration.",
+            "This archive appears fragmented.  Defragmentation is not yet implemented in this Python port.",
         )
 
     # ------------------------------------------------------------------
     def _validate(self) -> None:
-        """Placeholder validation action."""
+        """Validate the currently loaded archive and report any errors."""
 
         if not self.cachefile:
             return
-        QMessageBox.information(
-            self,
-            "Validate",
-            "Validation is not implemented in this demonstration.",
-        )
+
+        errors = self.cachefile.validate()
+        if errors:
+            text = "\n".join(errors[:20])
+            QMessageBox.warning(
+                self,
+                "Validate",
+                f"Problems were detected in the archive:\n{text}",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Validate",
+                "Archive appears to be valid.",
+            )
+
+    # ------------------------------------------------------------------
+    def _convert_gcf(self, target_version: int) -> None:
+        """Convert the loaded GCF to a given format version."""
+
+        if not self.cachefile or not self.cachefile.is_gcf():
+            QMessageBox.warning(self, "Convert", "No GCF archive loaded.")
+            return
+
+        default = os.path.splitext(self.cachefile.filename)[0] + f"_v{target_version}.gcf"
+        path, _ = QFileDialog.getSaveFileName(self, "Save Converted GCF", default, "GCF Files (*.gcf)")
+        if not path:
+            return
+        try:
+            self.cachefile.convert_version(target_version, path)
+            QMessageBox.information(self, "Convert", "Conversion completed.")
+        except NotImplementedError:
+            QMessageBox.warning(self, "Convert", "Conversion is not yet implemented in this build.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Convert", f"Conversion failed: {exc}")
 
     # ------------------------------------------------------------------
     def _open_options(self) -> None:
-        dialog = OptionsDialog(self)
-        dialog.exec()
+        dialog = OptionsDialog(self.settings, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.preview_toggle_action.setChecked(dialog.preview_enabled)
 
     # ------------------------------------------------------------------
     def _about(self) -> None:

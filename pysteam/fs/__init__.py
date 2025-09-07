@@ -10,11 +10,11 @@ class DirectoryFile:
     def size(self):
         return self.package._size(self)
 
-    def open(self, mode="rb"):
-        return self.package._open_file(self, mode)
+    def open(self, mode="rb", key=None):
+        return self.package._open_file(self, mode, key)
 
-    def extract(self, where, keep_folder_structure=True):
-        return self.package._extract_file(self, where, keep_folder_structure)
+    def extract(self, where, keep_folder_structure=True, key=None):
+        return self.package._extract_file(self, where, keep_folder_structure, key)
 
     def is_file(self):
         # Yep. We are a file. Peek at the class name if you need to.
@@ -49,8 +49,8 @@ class DirectoryFolder:
     def size(self):
         return sum(i.size() for i in self.items)
 
-    def extract(self, where, recursive=False, keep_folder_structure=True, filter=None):
-        return self.package._extract_folder(self, where, recursive, keep_folder_structure, filter)
+    def extract(self, where, recursive=False, keep_folder_structure=True, filter=None, key=None):
+        return self.package._extract_folder(self, where, recursive, keep_folder_structure, filter, key)
 
     def is_file(self):
         return False
@@ -113,7 +113,7 @@ class FilesystemPackage:
     def _size(self, entry):
         return os.path.getsize(entry.sys_path())
 
-    def _open_file(self, entry, mode):
+    def _open_file(self, entry, mode, key=None):
         return open(entry.sys_path(), mode)
 
     def _extract_file(self, *a, **b):
