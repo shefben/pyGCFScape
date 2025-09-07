@@ -34,7 +34,6 @@ from __future__ import annotations
 import os
 import sys
 import traceback
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
 
@@ -46,7 +45,7 @@ from PyQt5.QtCore import (
     pyqtSignal,
     QSize,
 )
-from PyQt5.QtGui import QIcon, QFont, QCloseEvent, QPixmap
+from PyQt5.QtGui import QIcon, QCloseEvent, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -63,7 +62,6 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QProgressDialog,
-    QPushButton,
     QSplitter,
     QStackedWidget,
     QStatusBar,
