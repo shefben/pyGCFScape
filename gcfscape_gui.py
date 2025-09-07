@@ -51,8 +51,9 @@ from PyQt5.QtCore import (
     QMimeData,
     QUrl,
     QModelIndex,
+    QPoint,
 )
-from PyQt5.QtGui import QIcon, QCloseEvent, QPixmap, QDesktopServices, QDrag
+from PyQt5.QtGui import QIcon, QCloseEvent, QPixmap, QDesktopServices, QDrag, QMouseEvent
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -231,9 +232,15 @@ class FileListWidget(QTreeWidget):
         if self.window.view_mode in ("details", "list"):
             index = self.indexAt(event.pos())
             if index.isValid() and index.column() != 0:
-                super().mousePressEvent(event)
-                self.clearSelection()
-                self.setCurrentIndex(QModelIndex())
+                fake = QMouseEvent(
+                    event.type(),
+                    QPoint(-1, -1),
+                    event.globalPos(),
+                    event.button(),
+                    event.buttons(),
+                    event.modifiers(),
+                )
+                super().mousePressEvent(fake)
                 return
         super().mousePressEvent(event)
 
