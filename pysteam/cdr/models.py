@@ -108,13 +108,13 @@ class Application(object):
 
 class ApplicationLaunchOptionRecord(object):
     def __str__(self):
-        return "%s's Launch Option Record %d" % (unicode(self.owner), self.option_id)
+        return "%s's Launch Option Record %d" % (str(self.owner), self.option_id)
 
     def parse(self, node):
 
         blob = node.child
         if len(blob.children) == 0:
-            raise ValueError, "Blob has no children"
+            raise ValueError("Blob has no children")
         self.option_id = struct.unpack("<l", node.key)[0]
 
         self.description = node[1].data
@@ -126,7 +126,7 @@ class ApplicationLaunchOptionRecord(object):
 
 class ApplicationVersionRecord(object):
     def __str__(self):
-        return "%s's Version Record %d" % (unicode(self.owner), self.version_id)
+        return "%s's Version Record %d" % (str(self.owner), self.version_id)
 
     def parse(self, node):
         self.version_id = struct.unpack("<l", node.key)[0]
@@ -161,7 +161,7 @@ class ApplicationFilesystemRecord(object):
             return Application.objects.get(app_id=self.app_id).get_mount_name()
 
     def __str__(self):
-        return "%s: Cache import: %s" % (unicode(self.owner), self.get_mount_name())
+        return "%s: Cache import: %s" % (str(self.owner), self.get_mount_name())
 
     def parse(self, node):
         self.app_id = struct.unpack("<l", node[1].data)[0]
@@ -170,7 +170,7 @@ class ApplicationFilesystemRecord(object):
 
 class ApplicationUserDefinedRecord(object):
     def __str__(self):
-        return "%s: User Defined Record" % unicode(self.owner)
+        return "%s: User Defined Record" % str(self.owner)
 
     def parse(self, node):
         self.key = node.key

@@ -41,7 +41,7 @@ class DirectoryFolder(object):
         return self.items[name]
 
     def __iter__(self):
-        return self.items.itervalues()
+        return self.items.values()
 
     def __len__(self):
         return len(self.items)
