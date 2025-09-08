@@ -12,6 +12,7 @@ import os
 import tempfile
 from typing import List, Sequence, Tuple
 
+from PyQt5.QtGui import QVector3D
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from . import detect_engine
