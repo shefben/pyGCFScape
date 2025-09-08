@@ -745,6 +745,13 @@ class GCFScapeWindow(QMainWindow):
             self.file_list.setColumnHidden(i, True)
         self.column_map = {name: idx for idx, name in enumerate(all_columns)}
 
+        # Track columns resized manually so automatic sizing can be skipped for
+        # them.  Columns are initially auto-sized to their contents but a manual
+        # resize by the user will freeze that column width until reset.
+        self._manual_columns: set[int] = set()
+        self._resizing_columns = False
+        header.sectionResized.connect(self._record_column_resize)
+
         splitter.addWidget(left_widget)
         splitter.addWidget(self.file_list)
         splitter.setStretchFactor(0, 1)
@@ -1102,6 +1109,7 @@ class GCFScapeWindow(QMainWindow):
         self._log(msg)
         self.preview_widget.clear()
         self.preview_dock.hide()
+        self._resize_columns()
 
     def _go_back(self) -> None:
         if self.history_index > 0:
@@ -1131,6 +1139,7 @@ class GCFScapeWindow(QMainWindow):
                     action = self.column_actions.get(name)
                     self.file_list.setColumnHidden(idx, not (action and action.isChecked()))
             self.file_list.setIconSize(QSize(16, 16))
+            self._resize_columns()
         else:
             self.file_list.setHeaderHidden(True)
             self.file_list.setColumnCount(1)
@@ -1159,6 +1168,27 @@ class GCFScapeWindow(QMainWindow):
         if idx is None:
             return
         self.file_list.setColumnHidden(idx, not checked)
+        self._resize_columns()
+
+    # ------------------------------------------------------------------
+    def _record_column_resize(self, index: int, old: int, new: int) -> None:
+        if not self._resizing_columns:
+            self._manual_columns.add(index)
+
+    # ------------------------------------------------------------------
+    def _resize_columns(self) -> None:
+        if self.view_mode != "details":
+            return
+        self._resizing_columns = True
+        try:
+            for idx in range(self.file_list.columnCount()):
+                if idx in self._manual_columns:
+                    continue
+                if self.file_list.isColumnHidden(idx):
+                    continue
+                self.file_list.resizeColumnToContents(idx)
+        finally:
+            self._resizing_columns = False
 
     # ------------------------------------------------------------------
     def dragEnterEvent(self, event):  # type: ignore[override]
@@ -1312,6 +1342,7 @@ class GCFScapeWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Search for '{self._search_pattern}' returned {len(self._search_results)} results."
             )
+            self._resize_columns()
             return
         folder = self._current_directory()
         if not folder:
@@ -1337,6 +1368,7 @@ class GCFScapeWindow(QMainWindow):
         self.forward_action_nav.setEnabled(self.history_index < len(self.history) - 1)
         root = self.cachefile.root if self.cachefile else None
         self.up_action_nav.setEnabled(folder is not root)
+        self._resize_columns()
 
     def _file_list_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         if not isinstance(item, EntryItem):
