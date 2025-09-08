@@ -30,17 +30,31 @@ try:  # pragma: no cover - optional dependencies
 except Exception:  # pragma: no cover - missing optional deps
     np = None  # type: ignore
 
-try:  # pragma: no cover - optional dependencies
-    import pyqtgraph.opengl as gl  # type: ignore
-    _gl_missing_dep: str | None = None
-except ModuleNotFoundError as exc:  # pragma: no cover - missing optional deps
+if np is not None:  # pragma: no cover - optional dependencies
+    try:
+        import pyqtgraph as pg  # type: ignore
+        import pyqtgraph.opengl as gl  # type: ignore
+        _gl_missing_dep: str | None = None
+    except ModuleNotFoundError as exc:  # pragma: no cover - missing optional deps
+        gl = None  # type: ignore
+        pg = None  # type: ignore
+        # ``pyqtgraph.opengl`` depends on ``PyOpenGL``.  Distinguish between the
+        # two so the user gets a helpful message about which package they need.
+        name = exc.name or "pyqtgraph"
+        if name.startswith("OpenGL"):
+            _gl_missing_dep = "PyOpenGL"
+        elif name == "numpy":
+            _gl_missing_dep = "numpy"
+        else:
+            _gl_missing_dep = "pyqtgraph"
+    except Exception:  # pragma: no cover - missing optional deps
+        gl = None  # type: ignore
+        pg = None  # type: ignore
+        _gl_missing_dep = "pyqtgraph"
+else:  # pragma: no cover - missing optional deps
     gl = None  # type: ignore
-    # ``pyqtgraph.opengl`` depends on ``PyOpenGL``.  Distinguish between the
-    # two so the user gets a helpful message about which package they need.
-    _gl_missing_dep = "PyOpenGL" if exc.name == "OpenGL" else "pyqtgraph"
-except Exception:  # pragma: no cover - missing optional deps
-    gl = None  # type: ignore
-    _gl_missing_dep = "pyqtgraph"
+    pg = None  # type: ignore
+    _gl_missing_dep = "numpy"
 
 
 class BSPViewWidget(QWidget):
@@ -136,7 +150,7 @@ class BSPViewWidget(QWidget):
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
         min_z, max_z = min(zs), max(zs)
-        center = QVector3D(
+        center = pg.Vector(
             (min_x + max_x) / 2,
             (min_y + max_y) / 2,
             (min_z + max_z) / 2,

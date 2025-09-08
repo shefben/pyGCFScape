@@ -965,18 +965,24 @@ class CacheFileAllocationTable:
         (self.sector_count,
          self.first_unused_entry,
          self.is_long_terminator) = struct.unpack("<3L", stream.read(12))
-        self.checksum = sum(stream.read(4))
+        # Checksum is stored as the sum of the three header fields rather
+        # than a byte-wise sum of the structure.  The previous implementation
+        # incorrectly summed the raw bytes which caused validation failures on
+        # legitimate v1 GCF files.
+        (self.checksum,) = struct.unpack("<L", stream.read(4))
 
-        self.terminator = 0xFFFFFFFF if self.owner.alloc_table.is_long_terminator == 1 else 0xFFFF
+        self.terminator = 0xFFFFFFFF if self.is_long_terminator else 0xFFFF
         self.entries = unpack_dword_list(stream, self.sector_count)
 
     def serialize(self):
         data = struct.pack("<3L", self.sector_count, self.first_unused_entry, self.is_long_terminator)
-        self.checksum = sum(data)
+        # Cache the checksum so subsequent calls to ``serialize`` or
+        # ``calculate_checksum`` are in agreement with the on-disk format.
+        self.checksum = self.sector_count + self.first_unused_entry + self.is_long_terminator
         return data + struct.pack("<L", self.checksum) + pack_dword_list(self.entries)
 
     def calculate_checksum(self):
-        return sum(self.serialize()[:12])
+        return self.sector_count + self.first_unused_entry + self.is_long_terminator
 
     def validate(self):
         if self.owner.header.sector_count != self.sector_count:
@@ -1069,11 +1075,19 @@ class CacheFileManifest:
         self.minimum_footprint_entries = unpack_dword_list(self.manifest_stream, self.num_of_minimum_footprint_files)
 
         # User Config Entries
-        self.user_config_entries = unpack_dword_list(self.manifest_stream, self.num_of_user_config_files)
+        self.user_config_entries = unpack_dword_list(
+            self.manifest_stream, self.num_of_user_config_files
+        )
 
-        # Manifest Map Header
-        (self.map_header_version,
-         self.map_dummy1) = struct.unpack("<2L", stream.read(8))
+        # Older GCF v1 directories omit the manifest-map header entirely and
+        # store the first-block indices directly after the manifest stream.
+        if self.owner.header.format_version <= 1:
+            self.map_header_version = 1
+            self.map_dummy1 = 0
+        else:
+            (self.map_header_version, self.map_dummy1) = struct.unpack(
+                "<2L", stream.read(8)
+            )
 
         # Manifest Map Entries (FirstBlockIndex)
         self.manifest_map_entries = unpack_dword_list(stream, self.node_count)
@@ -1101,9 +1115,12 @@ class CacheFileManifest:
         manifest_data.append(self.filename_table)
         manifest_data.append(pack_dword_list(self.hash_table_keys))
         manifest_data.append(pack_dword_list(self.hash_table_indices))
+        manifest_data.append(pack_dword_list(self.minimum_footprint_entries))
         manifest_data.append(pack_dword_list(self.user_config_entries))
-        manifest_data.append(pack_dword_list(self.hash_table_keys))
-        manifest_data.append(struct.pack("<2L", self.map_header_version, self.map_dummy1))
+        if self.owner.header.format_version > 1:
+            manifest_data.append(
+                struct.pack("<2L", self.map_header_version, self.map_dummy1)
+            )
         manifest_data.append(pack_dword_list(self.manifest_map_entries))
         manifest_data = b"".join(manifest_data)
 
@@ -1117,10 +1134,15 @@ class CacheFileManifest:
             raise ValueError("Invalid Cache File Manifest [Application version mismatch]")
         #if self.checksum != self.calculate_checksum():
         #    raise ValueError, "Invalid Cache File Manifest [Checksum mismatch]"
-        if self.map_header_version != 1:
-            raise ValueError("Invalid Cache File Manifest [ManifestHeaderMap's HeaderVersion is not 1]")
-        if self.map_dummy1 != 0:
-            raise ValueError("Invalid Cache File Manifest [ManifestHeaderMap's Dummy1 is not 0]")
+        if self.owner.header.format_version > 1:
+            if self.map_header_version != 1:
+                raise ValueError(
+                    "Invalid Cache File Manifest [ManifestHeaderMap's HeaderVersion is not 1]"
+                )
+            if self.map_dummy1 != 0:
+                raise ValueError(
+                    "Invalid Cache File Manifest [ManifestHeaderMap's Dummy1 is not 0]"
+                )
 
     def calculate_checksum(self):
         # Blank out checksum and fingerprint + hack to get unsigned value.

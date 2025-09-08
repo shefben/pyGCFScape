@@ -33,21 +33,23 @@ class ImageViewWidget(QWidget):
     def clear(self) -> None:
         self.label.setText("No preview")
         self.label.setPixmap(QPixmap())
+        self.label.setToolTip("")
 
     # ------------------------------------------------------------------
     def load_image(self, data: bytes) -> None:
         pix = QPixmap()
         if not pix.loadFromData(data) and Image is not None:
             try:
-                img = Image.open(BytesIO(data))
-                buf = BytesIO()
-                img.save(buf, format="PNG")
+                with Image.open(BytesIO(data)) as img:
+                    buf = BytesIO()
+                    img.save(buf, format="PNG")
                 pix.loadFromData(buf.getvalue(), "PNG")
             except Exception:
                 pix = QPixmap()
         if pix.isNull():
+            self.clear()
             self.label.setText("Unsupported image format")
-            self.label.setPixmap(QPixmap())
             return
+        self.label.setText("")
         self.label.setPixmap(pix)
         self.label.setToolTip(f"{pix.width()}x{pix.height()} image")
