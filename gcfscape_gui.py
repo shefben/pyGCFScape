@@ -94,6 +94,7 @@ from PyQt5.QtWidgets import (
 # The pysteam cache file parser is used to read GCF/NCF archives.  It
 # exposes a similar API to the original C++ version used by GCFScape.
 from pysteam.fs.cachefile import CacheFile, CacheFileManifestEntry
+from pysteam.fs.archive import open_archive
 from pysteam.bsp.preview import BSPViewWidget
 from pysteam.image import ImageViewWidget
 from pysteam.vtf.preview import VTFViewWidget
@@ -609,18 +610,18 @@ class PreviewWidget(QWidget):
         name = entry.name.lower()
         ext = os.path.splitext(name)[1]
         key = None
+        # Reset any previous preview to avoid stale state from a failed load.
+        self.clear()
         if is_encrypted(entry):
             if self.key_provider:
                 key = self.key_provider()
             if key is None:
-                self.clear()
                 return
 
         try:
             stream = entry.open("rb", key=key)
             data = stream.read(entry.size())
         except Exception:
-            self.clear()
             return
         finally:
             try:
@@ -1200,9 +1201,9 @@ class GCFScapeWindow(QMainWindow):
     def _open_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open Steam cache file",
+            "Open archive file",
             "",
-            "Steam Cache Files (*.gcf *.ncf *.vpk);;All Files (*)",
+            "Archive Files (*.gcf *.ncf *.vpk *.pak *.wad *.xzp *.zip *.7z *.gz *.tar *.rar);;All Files (*)",
         )
         if path:
             self._load_file(Path(path))
@@ -1211,7 +1212,10 @@ class GCFScapeWindow(QMainWindow):
     def _load_file(self, path: Path) -> None:
         self._decryption_key = None
         try:
-            self.cachefile = CacheFile.parse(path)
+            if path.suffix.lower() in {".gcf", ".ncf", ".vpk"}:
+                self.cachefile = CacheFile.parse(path)
+            else:
+                self.cachefile = open_archive(path)
         except Exception as exc:  # pragma: no cover - GUI feedback
             traceback.print_exc()
             QMessageBox.critical(self, "Error", str(exc))

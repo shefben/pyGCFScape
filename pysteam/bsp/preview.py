@@ -29,10 +29,31 @@ try:  # pragma: no cover - optional dependencies
 except Exception:  # pragma: no cover - missing optional deps
     np = None  # type: ignore
 
-try:  # pragma: no cover - optional dependencies
-    import pyqtgraph.opengl as gl  # type: ignore
-except Exception:  # pragma: no cover - missing optional deps
+if np is not None:  # pragma: no cover - optional dependencies
+    try:
+        import pyqtgraph as pg  # type: ignore
+        import pyqtgraph.opengl as gl  # type: ignore
+        _gl_missing_dep: str | None = None
+    except ModuleNotFoundError as exc:  # pragma: no cover - missing optional deps
+        gl = None  # type: ignore
+        pg = None  # type: ignore
+        # ``pyqtgraph.opengl`` depends on ``PyOpenGL``.  Distinguish between the
+        # two so the user gets a helpful message about which package they need.
+        name = exc.name or "pyqtgraph"
+        if name.startswith("OpenGL"):
+            _gl_missing_dep = "PyOpenGL"
+        elif name == "numpy":
+            _gl_missing_dep = "numpy"
+        else:
+            _gl_missing_dep = "pyqtgraph"
+    except Exception:  # pragma: no cover - missing optional deps
+        gl = None  # type: ignore
+        pg = None  # type: ignore
+        _gl_missing_dep = "pyqtgraph"
+else:  # pragma: no cover - missing optional deps
     gl = None  # type: ignore
+    pg = None  # type: ignore
+    _gl_missing_dep = "numpy"
 
 
 class BSPViewWidget(QWidget):
@@ -43,7 +64,8 @@ class BSPViewWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         if gl is None:
-            self.view: QWidget = QLabel("pyqtgraph module missing")
+            missing = _gl_missing_dep or "pyqtgraph"
+            self.view: QWidget = QLabel(f"{missing} module missing")
             layout.addWidget(self.view)
         else:
             self.view = gl.GLViewWidget()
@@ -68,7 +90,8 @@ class BSPViewWidget(QWidget):
             return
         if not gl:
             if isinstance(self.view, QLabel):
-                self.view.setText("pyqtgraph module missing")
+                missing = _gl_missing_dep or "pyqtgraph"
+                self.view.setText(f"{missing} module missing")
             return
         if not np:
             if isinstance(self.view, QLabel):
@@ -126,7 +149,11 @@ class BSPViewWidget(QWidget):
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
         min_z, max_z = min(zs), max(zs)
-        center = [(min_x + max_x) / 2, (min_y + max_y) / 2, (min_z + max_z) / 2]
+        center = pg.Vector(
+            (min_x + max_x) / 2,
+            (min_y + max_y) / 2,
+            (min_z + max_z) / 2,
+        )
         size = max(max_x - min_x, max_y - min_y, max_z - min_z) or 1.0
 
         self.view.opts["center"] = center
