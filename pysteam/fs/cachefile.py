@@ -882,14 +882,17 @@ class CacheFileBlockAllocationTableEntry:
 
     def parse(self, stream):
         # Block Entry
-        (self.flags,
-         self.dummy1,
-         self.file_data_offset,
-         self.file_data_size,
-         self._first_sector_index,
-         self._next_block_index,
-         self._prev_block_index,
-         self.manifest_index) = struct.unpack("<2H6L", stream.read(28))
+        (
+            self.entry_flags,
+            self.file_data_offset,
+            self.file_data_size,
+            self._first_sector_index,
+            self._next_block_index,
+            self._prev_block_index,
+            self.manifest_index,
+        ) = struct.unpack("<7L", stream.read(28))
+        # Maintain backwards compatibility with callers expecting ``flags``.
+        self.flags = self.entry_flags
 
     def _get_sector_iterator(self):
         sector = self.first_sector
@@ -939,7 +942,16 @@ class CacheFileBlockAllocationTableEntry:
     is_fragmented = property(_get_is_fragmented)
 
     def serialize(self):
-        return struct.pack("<2H6L", self.flags, self.dummy1, self.file_data_offset, self.file_data_size, self._first_sector_index, self._next_block_index, self._prev_block_index, self.manifest_index)
+        return struct.pack(
+            "<7L",
+            self.entry_flags,
+            self.file_data_offset,
+            self.file_data_size,
+            self._first_sector_index,
+            self._next_block_index,
+            self._prev_block_index,
+            self.manifest_index,
+        )
 
 class CacheFileAllocationTable:
 
@@ -994,18 +1006,69 @@ class CacheFileBlockEntryMap:
 
     def __init__(self, owner):
         self.owner = owner
-        self.entries = []
+        # ``entries`` stores block entry indices in linked-list order so that
+        # manifest map entries can be resolved to real block entries.
+        self.entries: list[int] = []
+        self.first_block_entry_index = 0
+        self.last_block_entry_index = 0
+        self.dummy0 = 0
 
     def parse(self, stream):
-        # Header contains block count followed by a checksum field
-        (self.block_count,) = struct.unpack("<L", stream.read(4))
-        self.checksum = sum(stream.read(4))
-        self.entries = unpack_dword_list(stream, self.block_count)
+        # Full header: block count, first & last entry indices, dummy field and
+        # checksum.  Older implementations only read the first DWORD which
+        # resulted in misaligned reads for v1 archives.
+        (
+            self.block_count,
+            self.first_block_entry_index,
+            self.last_block_entry_index,
+            self.dummy0,
+            self.checksum,
+        ) = struct.unpack("<5L", stream.read(20))
+
+        raw_entries = [struct.unpack("<2L", stream.read(8)) for _ in range(self.block_count)]
+
+        # Reconstruct a linear mapping from list position to block entry index
+        # by traversing the linked list defined by the raw entries.
+        ordered: list[int] = []
+        index = self.first_block_entry_index
+        visited = set()
+        for _ in range(self.block_count):
+            if index >= self.block_count or index in visited:
+                break
+            ordered.append(index)
+            visited.add(index)
+            index = raw_entries[index][1]
+
+        # Fallback in case of malformed data where not all entries are linked.
+        if len(ordered) < self.block_count:
+            ordered.extend(i for i in range(self.block_count) if i not in visited)
+
+        self.entries = ordered
 
     def serialize(self):
-        data = struct.pack("<L", self.block_count)
-        self.checksum = sum(data)
-        return data + struct.pack("<L", self.checksum) + pack_dword_list(self.entries)
+        self.block_count = len(self.entries)
+        self.first_block_entry_index = self.entries[0] if self.entries else 0
+        self.last_block_entry_index = self.entries[-1] if self.entries else 0
+        self.dummy0 = 0
+
+        # Build raw linked-list representation from the ordered list.
+        raw_entries = [(self.block_count, self.block_count)] * self.block_count
+        for pos, entry_index in enumerate(self.entries):
+            prev_idx = self.entries[pos - 1] if pos > 0 else self.block_count
+            next_idx = self.entries[pos + 1] if pos < self.block_count - 1 else self.block_count
+            raw_entries[entry_index] = (prev_idx, next_idx)
+
+        header = struct.pack(
+            "<4L",
+            self.block_count,
+            self.first_block_entry_index,
+            self.last_block_entry_index,
+            self.dummy0,
+        )
+        self.checksum = sum(header)
+        data = [header, struct.pack("<L", self.checksum)]
+        data.extend(struct.pack("<2L", *e) for e in raw_entries)
+        return b"".join(data)
 
 
 class CacheFileManifest:
@@ -1320,11 +1383,25 @@ class CacheFileSectorHeader:
             raise ValueError(
                 "Invalid Cache File Sector Header [ApplicationVersion mismatch]"
             )
-        if self.sector_count != self.owner.header.sector_count:
+        # Some early GCF revisions (notably version 1) report a truncated
+        # ``sector_count`` in the data header that does not match the value in
+        # the file header.  HLLib tolerates this discrepancy, so we only enforce
+        # equality for newer formats where both fields are known to agree.
+        if (
+            self.format_version > 1
+            and self.sector_count != self.owner.header.sector_count
+        ):
             raise ValueError(
                 "Invalid Cache File Sector Header [SectorCount mismatch]"
             )
-        if self.sector_size != self.owner.header.sector_size:
+        # Legacy GCFs may report a different sector size in the data header
+        # than in the file header.  HLLib accepts this mismatch, so only enforce
+        # equality for newer format revisions where both fields are known to
+        # agree.
+        if (
+            self.format_version > 1
+            and self.sector_size != self.owner.header.sector_size
+        ):
             raise ValueError(
                 "Invalid Cache File Sector Header [SectorSize mismatch]"
             )
