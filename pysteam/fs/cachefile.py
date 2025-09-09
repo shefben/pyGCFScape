@@ -1394,7 +1394,14 @@ class CacheFileSectorHeader:
             raise ValueError(
                 "Invalid Cache File Sector Header [SectorCount mismatch]"
             )
-        if self.sector_size != self.owner.header.sector_size:
+        # Legacy GCFs may report a different sector size in the data header
+        # than in the file header.  HLLib accepts this mismatch, so only enforce
+        # equality for newer format revisions where both fields are known to
+        # agree.
+        if (
+            self.format_version > 1
+            and self.sector_size != self.owner.header.sector_size
+        ):
             raise ValueError(
                 "Invalid Cache File Sector Header [SectorSize mismatch]"
             )
