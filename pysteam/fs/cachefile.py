@@ -1383,7 +1383,14 @@ class CacheFileSectorHeader:
             raise ValueError(
                 "Invalid Cache File Sector Header [ApplicationVersion mismatch]"
             )
-        if self.sector_count != self.owner.header.sector_count:
+        # Some early GCF revisions (notably version 1) report a truncated
+        # ``sector_count`` in the data header that does not match the value in
+        # the file header.  HLLib tolerates this discrepancy, so we only enforce
+        # equality for newer formats where both fields are known to agree.
+        if (
+            self.format_version > 1
+            and self.sector_count != self.owner.header.sector_count
+        ):
             raise ValueError(
                 "Invalid Cache File Sector Header [SectorCount mismatch]"
             )
