@@ -4,7 +4,6 @@ import struct
 import binascii
 import zlib
 import hashlib
-from io import BytesIO
 from dataclasses import dataclass, field
 from typing import BinaryIO, Optional, List, Callable
 
@@ -945,38 +944,25 @@ class GCFFile:
         entry = self.directory_entries[file_index]
         if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED and not self.read_encrypted:
             raise ValueError("File is encrypted")
-        output = bytearray()
-        block_entry_index = self.directory_map_entries[file_index].first_block_index
-        data_block_terminator = (
-            0x0000FFFF
-            if self.fragmentation_map_header and self.fragmentation_map_header.terminator == 0
-            else 0xFFFFFFFF
-        )
-        while block_entry_index != self.data_block_header.block_count:
-            block_entry = self.block_entries[block_entry_index]
-            remaining = block_entry.file_data_size
-            data_block_index = block_entry.first_data_block_index
-            while remaining > 0 and data_block_index < data_block_terminator:
-                to_read = min(self.data_block_header.block_size, remaining)
-                offset = self.data_block_header.first_block_offset + data_block_index * self.data_block_header.block_size
-                self.stream.seek(offset)
-                output.extend(self.stream.read(to_read))
-                remaining -= to_read
-                data_block_index = self.fragmentation_map[data_block_index].next_data_block_index
-            block_entry_index = block_entry.next_block_entry_index
-        raw = bytes(output)
+
+        stream = self.open_stream(file_index)
+        try:
+            raw = stream.read()
+        finally:
+            stream.close()
+
         if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED:
             key = self._get_encryption_key()
             raw = decrypt_gcf_data(raw, key)
-        return raw[: entry.item_size]
+
+        return raw
 
     def open_stream(self, file_index: int) -> "BinaryIO":
         """Return a stream for the given file index."""
         entry = self.directory_entries[file_index]
-        if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED:
-            if not self.read_encrypted:
-                raise ValueError("File is encrypted")
-            return BytesIO(self.read_file(file_index))
+        if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED and not self.read_encrypted:
+            raise ValueError("File is encrypted")
+
         from gcfstream import GCFStream
 
         return GCFStream(self, file_index)

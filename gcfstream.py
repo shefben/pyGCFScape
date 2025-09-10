@@ -1,3 +1,11 @@
+"""Streaming access to file data stored inside a :class:`GCFFile`.
+
+The logic is a direct translation of the block traversal performed by
+``GCFStream.cpp`` in HLLib.  It walks the block and fragmentation tables once
+during initialization and then exposes a minimal ``read``/``seek``/``tell``
+interface for consumption by :class:`GCFFile`.
+"""
+
 from __future__ import annotations
 
 import os
