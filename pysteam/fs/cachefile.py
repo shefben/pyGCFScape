@@ -311,6 +311,22 @@ class CacheFile:
             block_entry_map = None
             owner.block_entry_map = None
 
+        # Older directory headers differ significantly from newer manifest
+        # layouts.  When targeting version 1 we rewrite the manifest header
+        # fields to mirror the legacy structure described in ``GCFDirectoryHeader``
+        # from HLLib:
+        if target_version == 1:
+            manifest.header_version = 4  # uiDummy0 constant
+            manifest.application_id = header.cache_id
+            manifest.application_version = header.last_version_played
+            manifest.compression_block_size = HL_GCF_CHECKSUM_LENGTH
+            manifest.hash_table_keys = []
+            manifest.hash_table_indices = [0] * manifest.node_count
+            manifest.minimum_footprint_entries = []
+            manifest.user_config_entries = []
+            manifest.depot_info = 0
+            manifest.fingerprint = 0
+
         # Generate a checksum map when targeting newer formats.
         if target_version > 1:
             if checksum_map is None:
@@ -1302,39 +1318,54 @@ class CacheFileManifest:
         self.manifest_map_entries = unpack_dword_list(stream, self.node_count)
 
     def serialize(self):
-        # 56 = size of Header
+        # 56 = size of header
         # 32 = size of ManifestEntry + size of DWORD for HashTableIndices
+        self.hash_table_key_count = len(self.hash_table_keys)
+        self.num_of_user_config_files = len(self.user_config_entries)
+        self.num_of_minimum_footprint_files = len(self.minimum_footprint_entries)
         self.name_size = len(self.filename_table)
-        self.binary_size = 56 + 32*self.node_count + self.name_size + 4*(self.hash_table_key_count+self.num_of_user_config_files+self.num_of_minimum_footprint_files)
-        self.header_data = struct.pack("<9L",
-          self.header_version,
-          self.application_id,
-          self.application_version,
-          self.node_count,
-          self.file_count,
-          self.compression_block_size,
-          self.binary_size,
-          self.name_size,
-          self.depot_info)
+        self.binary_size = 56 + 32 * self.node_count + self.name_size + 4 * (
+            self.hash_table_key_count
+            + self.num_of_user_config_files
+            + self.num_of_minimum_footprint_files
+        )
 
-        manifest_data = []
+        manifest_data_parts = []
         for i in self.manifest_entries:
-            manifest_data.append(i.serialize())
+            manifest_data_parts.append(i.serialize())
 
-        manifest_data.append(self.filename_table)
-        manifest_data.append(pack_dword_list(self.hash_table_keys))
-        manifest_data.append(pack_dword_list(self.hash_table_indices))
-        manifest_data.append(pack_dword_list(self.minimum_footprint_entries))
-        manifest_data.append(pack_dword_list(self.user_config_entries))
+        manifest_data_parts.append(self.filename_table)
+        manifest_data_parts.append(pack_dword_list(self.hash_table_keys))
+        manifest_data_parts.append(pack_dword_list(self.hash_table_indices))
+        manifest_data_parts.append(pack_dword_list(self.minimum_footprint_entries))
+        manifest_data_parts.append(pack_dword_list(self.user_config_entries))
         if self.owner.header.format_version > 1:
-            manifest_data.append(
+            manifest_data_parts.append(
                 struct.pack("<2L", self.map_header_version, self.map_dummy1)
             )
-        manifest_data.append(pack_dword_list(self.manifest_map_entries))
-        manifest_data = b"".join(manifest_data)
+        manifest_data_parts.append(pack_dword_list(self.manifest_map_entries))
+        manifest_data = b"".join(manifest_data_parts)
 
-        self.checksum = adler32(self.header_data + b"\0\0\0\0\0\0\0\0" + manifest_data, 0)
-        return self.header_data + struct.pack("<2L", self.fingerprint, self.checksum) + manifest_data
+        header_without_checksum = struct.pack(
+            "<13L",
+            self.header_version,
+            self.application_id,
+            self.application_version,
+            self.node_count,
+            self.file_count,
+            self.compression_block_size,
+            self.binary_size,
+            self.name_size,
+            self.hash_table_key_count,
+            self.num_of_minimum_footprint_files,
+            self.num_of_user_config_files,
+            self.depot_info,
+            self.fingerprint,
+        )
+        self.header_data = header_without_checksum
+
+        self.checksum = adler32(header_without_checksum + b"\0\0\0\0" + manifest_data, 0) & 0xFFFFFFFF
+        return header_without_checksum + struct.pack("<L", self.checksum) + manifest_data
 
     def validate(self):
         if self.owner.header.application_id != self.application_id:
