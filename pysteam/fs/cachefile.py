@@ -1438,13 +1438,27 @@ class CacheFileSectorHeader:
             raise ValueError(
                 "Invalid Cache File Sector Header [SectorSize mismatch]"
             )
-        if self.checksum != self.calculate_checksum():
+        # Some early (v1) GCF files are known to store an invalid checksum in
+        # the data header.  HLLib ignores this discrepancy, so we only enforce
+        # checksum validation for newer format revisions.
+        if self.format_version > 1 and self.checksum != self.calculate_checksum():
             raise ValueError(
                 "Invalid Cache File Sector Header [Checksum mismatch]"
             )
 
     def calculate_checksum(self):
-        return self.sector_count + self.sector_size + self.first_sector_offset + self.sectors_used
+        # The checksum stored in the data header is a 32-bit unsigned sum of
+        # the following fields.  Clamp intermediate results to 32 bits to match
+        # the behavior of the original C++ implementation.
+        checksum = 0
+        for value in (
+            self.sector_count,
+            self.sector_size,
+            self.first_sector_offset,
+            self.sectors_used,
+        ):
+            checksum = (checksum + value) & 0xFFFFFFFF
+        return checksum
 
 class CacheFileSector:
 
