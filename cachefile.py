@@ -5,6 +5,7 @@ import binascii
 import zlib
 import hashlib
 from dataclasses import dataclass, field
+from io import BytesIO
 from typing import BinaryIO, Optional, List, Callable
 
 try:  # Optional dependency for AES-based decryption
@@ -941,27 +942,36 @@ class GCFFile:
         return size
 
     def read_file(self, file_index: int) -> bytes:
-        entry = self.directory_entries[file_index]
-        if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED and not self.read_encrypted:
-            raise ValueError("File is encrypted")
-
+        """Return the contents of the specified file."""
         stream = self.open_stream(file_index)
         try:
-            raw = stream.read()
+            return stream.read()
         finally:
             stream.close()
 
-        if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED:
-            key = self._get_encryption_key()
-            raw = decrypt_gcf_data(raw, key)
-
-        return raw
-
     def open_stream(self, file_index: int) -> "BinaryIO":
-        """Return a stream for the given file index."""
+        """Return a stream for the given file index.
+
+        Encrypted files are fully decrypted and decompressed into memory before
+        being exposed as a ``BytesIO`` stream.  If ``read_encrypted`` is ``False``
+        or the required cryptography backend is unavailable, a ``ValueError`` is
+        raised.
+        """
         entry = self.directory_entries[file_index]
-        if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED and not self.read_encrypted:
-            raise ValueError("File is encrypted")
+        if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED:
+            if not self.read_encrypted:
+                raise ValueError(
+                    "File is encrypted; initialize with read_encrypted=True to read it"
+                )
+            from gcfstream import GCFStream
+
+            raw = GCFStream(self, file_index).read()
+            try:
+                key = self._get_encryption_key()
+                data = decrypt_gcf_data(raw, key)
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise ValueError("pycryptodome is required for encrypted GCF support") from exc
+            return BytesIO(data)
 
         from gcfstream import GCFStream
 
@@ -993,8 +1003,6 @@ class GCFFile:
         if size != entry.item_size:
             return "incomplete"
 
-        if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED:
-            return "assumed-ok"
         if entry.checksum_index == 0xFFFFFFFF or not self.checksum_map_entries:
             return "assumed-ok"
 
