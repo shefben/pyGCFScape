@@ -658,12 +658,12 @@ class PreviewWidget(QWidget):
                 base = os.path.splitext(entry.name)[0]
                 vvd_entry = folder.items.get(base + ".vvd")
                 if vvd_entry:
-                    with vvd_entry.open("rb") as s:
+                    with vvd_entry.open("rb", key=key) as s:
                         vvd_data = s.read(vvd_entry.size())
                 # VTX files may have platform/LOD suffixes; pick the first match
                 for name, ent in folder.items.items():
                     if name.startswith(base) and name.endswith(".vtx"):
-                        with ent.open("rb") as s:
+                        with ent.open("rb", key=key) as s:
                             vtx_data = s.read(ent.size())
                         break
             except Exception:
@@ -1064,7 +1064,13 @@ class GCFScapeWindow(QMainWindow):
     def _open_entry(self, entry) -> None:
         try:
             temp_dir = tempfile.mkdtemp(prefix="pysteam_open_")
-            entry.extract(temp_dir, keep_folder_structure=False)
+            key = None
+            if is_encrypted(entry):
+                key = self._get_decryption_key()
+                if key is None:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    return
+            entry.extract(temp_dir, keep_folder_structure=False, key=key)
             path = os.path.join(temp_dir, entry.name)
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
             self._temp_dirs.append(temp_dir)
