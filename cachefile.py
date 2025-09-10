@@ -517,6 +517,10 @@ class GCFFile:
             self.block_entry_map = []
 
         self.directory_header = GCFDirectoryHeader.read(self.stream)
+        # Remember the file offset of the directory entries so that individual
+        # entries can be updated in-place (e.g. when clearing the encrypted flag
+        # after decryption).
+        self._directory_entries_offset = self.stream.tell()
         self.directory_entries = [
             GCFDirectoryEntry.read(self.stream)
             for _ in range(self.directory_header.item_count)
@@ -976,6 +980,69 @@ class GCFFile:
         from gcfstream import GCFStream
 
         return GCFStream(self, file_index)
+
+    # ------------------------------------------------------------------
+    # Decryption
+    # ------------------------------------------------------------------
+    def decrypt_file(self, file_index: int, key: bytes | None = None) -> int:
+        """Decrypt ``file_index`` in-place and return the number of bytes written.
+
+        The routine mirrors ``CGCFFile::DecryptFile`` from HLLib.  File data is
+        streamed from the cache, decrypted (and decompressed if necessary) and
+        then written back to the underlying archive.  On success the encrypted
+        flag is cleared from the directory entry.
+        """
+
+        entry = self.directory_entries[file_index]
+        if not (entry.directory_flags & HL_GCF_FLAG_ENCRYPTED):
+            return entry.item_size
+
+        from gcfstream import GCFStream
+
+        raw_stream = GCFStream(self, file_index)
+        raw = raw_stream.read()
+
+        if key is None:
+            key = self._get_encryption_key()
+
+        data = decrypt_gcf_data(raw, key)
+
+        if len(data) != entry.item_size:
+            raise ValueError("Decrypted data size mismatch")
+
+        pos = 0
+        for _, block_index, length in raw_stream._segments:
+            file_offset = (
+                self.data_block_header.first_block_offset
+                + block_index * self.data_block_header.block_size
+            )
+            self.stream.seek(file_offset)
+            self.stream.write(data[pos : pos + length])
+            pos += length
+
+        # Clear the encrypted flag and update the directory entry on disk.
+        entry.directory_flags &= ~HL_GCF_FLAG_ENCRYPTED
+        if hasattr(self, "_directory_entries_offset"):
+            offset = self._directory_entries_offset + file_index * 28 + 12
+            self.stream.seek(offset)
+            self.stream.write(struct.pack("<I", entry.directory_flags))
+
+        self.stream.flush()
+        return len(data)
+
+    def decrypt_item(self, index: int = 0, key: bytes | None = None) -> int:
+        """Recursively decrypt ``index`` and its children."""
+
+        entry = self.directory_entries[index]
+        if entry.directory_flags & HL_GCF_FLAG_FILE:
+            return self.decrypt_file(index, key)
+
+        total = 0
+        child = entry.first_index
+        while child and child != 0xFFFFFFFF:
+            total += self.decrypt_item(child, key)
+            child = self.directory_entries[child].next_index
+        return total
 
     def validate_file(
         self,
