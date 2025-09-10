@@ -341,13 +341,27 @@ class CacheFile:
         self,
         out_path: str,
         progress: Callable[[int, int], None] | None = None,
+        cancel_flag: object | None = None,
     ) -> None:
         """Write a defragmented copy of this GCF archive to ``out_path``.
 
         The implementation rewrites the allocation table so that all sectors
-        for each block are stored sequentially.  A new cache file is written to
-        ``out_path``; the in-memory representation of this instance is left
-        untouched.  Only GCF archives are supported.
+        for each block are stored sequentially without staging the entire file
+        in memory.  A new cache file is written to ``out_path``; the in-memory
+        representation of this instance is left untouched.  Only GCF archives
+        are supported.
+
+        Parameters
+        ----------
+        out_path:
+            Destination path for the defragmented archive.
+        progress:
+            Optional callback invoked with ``(bytes_done, bytes_total)`` after
+            each sector is copied.
+        cancel_flag:
+            Optional mutable object that evaluates to ``True`` when the
+            operation should be cancelled.  Types such as ``threading.Event`` or
+            ``[bool]`` (single-item lists) are supported.
         """
 
         if not self.is_parsed:
@@ -363,20 +377,15 @@ class CacheFile:
         terminator = self.alloc_table.terminator
 
         new_alloc: list[int] = []
-        data_chunks: list[bytes] = []
 
         files = [
             m
             for m in self.manifest.manifest_entries
             if (m.directory_flags & CacheFileManifestEntry.FLAG_IS_FILE) != 0
         ]
-        total_files = len(files)
 
-        # Step through each file in directory order and rebuild allocation
-        # tables so that all sectors are stored sequentially.  This mirrors the
-        # logic of HLLib's ``CGCFFile::DefragmentInternal`` but writes the result
-        # to a new archive on disk.
-        for idx, mentry in enumerate(files, 1):
+        # First pass: rebuild allocation tables without touching file data.
+        for mentry in files:
             block = mentry.first_block
             while block is not None:
                 sectors = list(block.sectors)
@@ -384,16 +393,12 @@ class CacheFile:
                 block.file_data_offset = len(new_alloc) * sector_size
                 block.file_data_size = len(sectors) * sector_size
 
-                for i, sector in enumerate(sectors):
-                    data_chunks.append(sector.get_data())
+                for i, _ in enumerate(sectors):
                     if i == len(sectors) - 1:
                         new_alloc.append(terminator)
                     else:
                         new_alloc.append(len(new_alloc) + 1)
                 block = block.next_block
-
-            if progress:
-                progress(idx, total_files)
 
         # Update tables with new allocation info
         self.alloc_table.entries = new_alloc
@@ -403,6 +408,18 @@ class CacheFile:
         self.blocks.last_block_used = len(self.blocks.blocks) - 1
         self.data_header.sector_count = len(new_alloc)
         self.data_header.sectors_used = len(new_alloc)
+
+        total_bytes = len(new_alloc) * sector_size
+        bytes_done = 0
+
+        def _cancelled() -> bool:
+            if cancel_flag is None:
+                return False
+            if isinstance(cancel_flag, (list, tuple)):
+                return bool(cancel_flag[0])
+            if hasattr(cancel_flag, "is_set"):
+                return bool(cancel_flag.is_set())
+            return bool(cancel_flag)
 
         with open(out_path, "wb") as out:
             out.write(self.header.serialize())
@@ -417,7 +434,23 @@ class CacheFile:
 
             self.data_header.first_sector_offset = out.tell() + 24
             out.write(self.data_header.serialize())
-            out.write(b"".join(data_chunks))
+
+            for mentry in files:
+                if _cancelled():
+                    break
+                block = mentry.first_block
+                while block is not None and not _cancelled():
+                    for sector in block.sectors:
+                        out.write(sector.get_data())
+                        bytes_done += sector_size
+                        if progress:
+                            progress(bytes_done, total_bytes)
+                        if _cancelled():
+                            break
+                    block = block.next_block
+
+        if progress and bytes_done < total_bytes:
+            progress(bytes_done, total_bytes)
 
         # Re-open the original stream in case subsequent operations are
         # performed on this instance.
