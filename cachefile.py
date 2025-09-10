@@ -3,8 +3,15 @@ from __future__ import annotations
 import struct
 import binascii
 import zlib
+import hashlib
+from io import BytesIO
 from dataclasses import dataclass, field
 from typing import BinaryIO, Optional, List, Callable
+
+try:  # Optional dependency for AES-based decryption
+    from Crypto.Cipher import AES  # type: ignore
+except Exception:  # pragma: no cover - handled at runtime
+    AES = None
 
 # ---------------------------------------------------------------------------
 # Flag constants pulled directly from HLLib's GCFFile.cpp
@@ -34,6 +41,59 @@ ITEM_ATTRIBUTE_NAMES = [
     "Flags",
     "Fragmentation",
 ]
+
+
+def _normalize_key(key: bytes) -> bytes:
+    for size in (16, 24, 32):
+        if len(key) <= size:
+            return key.ljust(size, b"\x00")
+    return key[:32]
+
+
+def _decrypt_aes(data: bytes, key: bytes) -> bytes:
+    if AES is None:
+        raise ImportError("pycryptodome is required for encrypted GCF support")
+    key = _normalize_key(key)
+    pad = (-len(data)) % 16
+    cipher = AES.new(key, AES.MODE_CBC, b"\x00" * 16)
+    dec = cipher.decrypt(data + b"\x00" * pad)
+    if pad:
+        dec = dec[:-pad]
+    return dec
+
+
+def decrypt_gcf_data(data: bytes, key: bytes) -> bytes:
+    """Decrypt and decompress ``data`` from an encrypted GCF file."""
+    out = bytearray()
+    pos = 0
+    while pos < len(data):
+        chunk = data[pos : pos + HL_GCF_CHECKSUM_LENGTH]
+        if len(chunk) < 8:
+            break
+        comp_size, uncomp_size = struct.unpack_from("<ii", chunk, 0)
+        if (
+            uncomp_size > HL_GCF_CHECKSUM_LENGTH
+            or comp_size > uncomp_size
+            or uncomp_size < -1
+            or comp_size < -1
+        ):
+            dec = _decrypt_aes(chunk, key)
+            out.extend(dec)
+            pos += HL_GCF_CHECKSUM_LENGTH
+        else:
+            enc = chunk[: 8 + comp_size]
+            dec = _decrypt_aes(enc, key)
+            try:
+                out.extend(zlib.decompress(dec[8:8 + comp_size]))
+            except zlib.error:
+                out.extend(dec[8:8 + comp_size])
+            pos += 8 + comp_size
+    return bytes(out)
+
+
+def _derive_key(cache_id: int) -> bytes:
+    """Derive the AES key for ``cache_id`` using Steam's GCF key algorithm."""
+    return hashlib.md5(struct.pack("<I", cache_id)).digest()
 
 ###############################################################################
 # 1.  Structure definitions (direct C++ -> Python translation)
@@ -365,7 +425,7 @@ class DirectoryFolder(DirectoryItem):
 class GCFFile:
     """Python re-implementation of HLLib's CGCFFile."""
 
-    def __init__(self, source: BinaryIO | str):
+    def __init__(self, source: BinaryIO | str, read_encrypted: bool = False):
         if isinstance(source, (str, bytes, bytearray)):
             # Open in read/write mode so that defragmentation can update the file
             # in-place.  Callers that only need read access may pass an existing
@@ -404,8 +464,18 @@ class GCFFile:
         self.directory_items: List[Optional[DirectoryItem]] = []
         self.root: Optional[DirectoryFolder] = None
 
+        # Whether encrypted files should be read and decrypted.
+        self.read_encrypted = read_encrypted
+
         self.map_data_structures()
         self.build_directory_tree()
+
+    def _get_encryption_key(self) -> bytes:
+        if not hasattr(self, "_encryption_key"):
+            if not self.header:
+                raise ValueError("Cache file not parsed")
+            self._encryption_key = _derive_key(self.header.cache_id)
+        return self._encryption_key
 
     # ------------------------------------------------------------------
     # Mapping / unmapping
@@ -873,6 +943,8 @@ class GCFFile:
 
     def read_file(self, file_index: int) -> bytes:
         entry = self.directory_entries[file_index]
+        if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED and not self.read_encrypted:
+            raise ValueError("File is encrypted")
         output = bytearray()
         block_entry_index = self.directory_map_entries[file_index].first_block_index
         data_block_terminator = (
@@ -892,10 +964,19 @@ class GCFFile:
                 remaining -= to_read
                 data_block_index = self.fragmentation_map[data_block_index].next_data_block_index
             block_entry_index = block_entry.next_block_entry_index
-        return bytes(output[: entry.item_size])
+        raw = bytes(output)
+        if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED:
+            key = self._get_encryption_key()
+            raw = decrypt_gcf_data(raw, key)
+        return raw[: entry.item_size]
 
-    def open_stream(self, file_index: int) -> "GCFStream":
-        """Return a :class:`GCFStream` for the given file index."""
+    def open_stream(self, file_index: int) -> "BinaryIO":
+        """Return a stream for the given file index."""
+        entry = self.directory_entries[file_index]
+        if entry.directory_flags & HL_GCF_FLAG_ENCRYPTED:
+            if not self.read_encrypted:
+                raise ValueError("File is encrypted")
+            return BytesIO(self.read_file(file_index))
         from gcfstream import GCFStream
 
         return GCFStream(self, file_index)
