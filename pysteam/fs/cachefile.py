@@ -317,9 +317,9 @@ class CacheFile:
         # from HLLib:
         if target_version == 1:
             manifest.header_version = 4  # uiDummy0 constant
-            manifest.application_id = header.cache_id
-            manifest.application_version = header.last_version_played
-            manifest.compression_block_size = HL_GCF_CHECKSUM_LENGTH
+            manifest.application_id = header.application_id
+            manifest.application_version = header.application_version
+            manifest.compression_block_size = CACHE_CHECKSUM_LENGTH
             manifest.hash_table_keys = []
             manifest.hash_table_indices = [0] * manifest.node_count
             manifest.minimum_footprint_entries = []
