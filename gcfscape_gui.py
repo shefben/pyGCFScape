@@ -1671,7 +1671,10 @@ class GCFScapeWindow(QMainWindow):
                 self.cachefile.data_header.sectors_used
                 * self.cachefile.data_header.sector_size
             )
-        progress = QProgressDialog("Converting…", None, 0, total, self)
+        # ``QProgressDialog`` accepts only 32-bit signed integers.  Clamp the
+        # range so extremely large archives don't overflow the limit.
+        total = min(total, 0x7FFFFFFF)
+        progress = QProgressDialog("Converting…", None, 0, int(total), self)
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
 
