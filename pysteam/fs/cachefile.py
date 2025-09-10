@@ -260,13 +260,23 @@ class CacheFile:
             raise ValueError("Unsupported GCF version: %d" % target_version)
 
         # Deep copy structures so serialisation does not mutate the source.
-        header = copy.deepcopy(self.header)
-        blocks = copy.deepcopy(self.blocks)
-        alloc_table = copy.deepcopy(self.alloc_table)
-        block_entry_map = copy.deepcopy(self.block_entry_map)
-        manifest = copy.deepcopy(self.manifest)
-        data_header = copy.deepcopy(self.data_header)
-        checksum_map = copy.deepcopy(self.checksum_map) if self.checksum_map else None
+        # Exclude the cache file object (which holds an open stream) from the
+        # copy operation to avoid pickling errors on file-like objects.
+        memo = {id(self): None}
+        try:
+            memo[id(self.stream)] = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        header = copy.deepcopy(self.header, memo)
+        blocks = copy.deepcopy(self.blocks, memo)
+        alloc_table = copy.deepcopy(self.alloc_table, memo)
+        block_entry_map = copy.deepcopy(self.block_entry_map, memo)
+        manifest = copy.deepcopy(self.manifest, memo)
+        data_header = copy.deepcopy(self.data_header, memo)
+        checksum_map = (
+            copy.deepcopy(self.checksum_map, memo) if self.checksum_map else None
+        )
 
         # Temporary owner that mirrors the structure expected by the various
         # serialisation routines.
@@ -784,7 +794,9 @@ class CacheFile:
                 chunk = stream.read(to_read)
                 if len(chunk) != to_read:
                     return "size mismatch"
-                chk = (adler32(chunk) & 0xFFFFFFFF) ^ (zlib.crc32(chunk) & 0xFFFFFFFF)
+                chk = (adler32(chunk, 0) & 0xFFFFFFFF) ^ (
+                    zlib.crc32(chunk) & 0xFFFFFFFF
+                )
                 if chk != self.checksum_map.checksums[first + i]:
                     return "checksum mismatch"
                 remaining -= to_read
