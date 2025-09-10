@@ -4,7 +4,7 @@ import struct
 import binascii
 import zlib
 from dataclasses import dataclass, field
-from typing import BinaryIO, Optional, List
+from typing import BinaryIO, Optional, List, Callable
 
 # ---------------------------------------------------------------------------
 # Flag constants pulled directly from HLLib's GCFFile.cpp
@@ -618,44 +618,71 @@ class GCFFile:
     # ------------------------------------------------------------------
     # Defragmentation utilities
     # ------------------------------------------------------------------
-    def defragment(self, force: bool = False) -> bool:
+    def defragment(
+        self,
+        force: bool = False,
+        progress: Callable[[Optional[DirectoryFile], int, int, int, int], bool] | None = None,
+    ) -> bool:
         """Rewrite data blocks sequentially to eliminate fragmentation.
-
-        This mirrors ``CGCFFile::DefragmentInternal`` from HLLib.  The
-        implementation is intentionally conservative: all data blocks are read
-        into memory before any writes occur to avoid overwriting blocks whose
-        contents have not yet been copied.
 
         Parameters
         ----------
         force:
             If ``True`` the file will be rewritten even if no fragmentation is
-            detected.  HLLib exposes a similar flag to force lexicographical
-            ordering.
+            detected.  ``True`` also forces lexicographical ordering of file
+            data blocks.
+        progress:
+            Optional callback invoked after each data block is written.  The
+            callback receives ``(file, files_defragmented, files_total,
+            bytes_defragmented, bytes_total)`` and should return ``True`` to
+            continue or ``False`` to cancel the operation.
 
         Returns
         -------
         bool
-            ``True`` if the operation completed, ``False`` otherwise.
+            ``True`` if the operation completed, ``False`` if cancelled.
         """
 
         if not self.stream.writable():
-            raise IOError("underlying stream is not writable; defragmentation requires write access")
+            raise IOError(
+                "underlying stream is not writable; defragmentation requires write access"
+            )
 
         if not self.fragmentation_map_header or not self.data_block_header:
             return False
 
-        # Determine current fragmentation state.
         blocks_fragmented = 0
         blocks_used = 0
+        files_total = 0
+        file_block_counts: dict[int, int] = {}
+        file_indices: list[int] = []
         for i, entry in enumerate(self.directory_entries):
             if entry.directory_flags & HL_GCF_FLAG_FILE:
                 f, u = self.get_item_fragmentation(i)
                 blocks_fragmented += f
                 blocks_used += u
+                files_total += 1
+                file_block_counts[i] = u
+                file_indices.append(i)
+
+        block_size = self.data_block_header.block_size
+        bytes_total = blocks_used * block_size
 
         if (blocks_fragmented == 0 and not force) or blocks_used == 0:
+            if progress:
+                progress(None, files_total, files_total, bytes_total, bytes_total)
             return True
+
+        def _item_path(index: int) -> str:
+            item = self.directory_items[index]
+            parts = []
+            while item and item.parent is not None:
+                parts.append(item.name)
+                item = item.parent
+            return "/".join(reversed(parts))
+
+        if force:
+            file_indices.sort(key=_item_path)
 
         terminator = (
             0x0000FFFF
@@ -663,72 +690,120 @@ class GCFFile:
             else 0xFFFFFFFF
         )
 
-        # ------------------------------------------------------------------
-        # Build a mapping from old data block index -> new sequential index.
-        # ------------------------------------------------------------------
         mapping: dict[int, int] = {}
+        block_owner: dict[int, int] = {}
         next_index = 0
-        for i, entry in enumerate(self.directory_entries):
-            if entry.directory_flags & HL_GCF_FLAG_FILE:
-                block_entry_index = self.directory_map_entries[i].first_block_index
-                while block_entry_index != self.data_block_header.block_count:
-                    block_entry = self.block_entries[block_entry_index]
-                    remaining = block_entry.file_data_size
-                    data_block_index = block_entry.first_data_block_index
-                    while remaining > 0 and data_block_index < terminator:
-                        mapping[data_block_index] = next_index
-                        next_index += 1
-                        remaining -= self.data_block_header.block_size
-                        data_block_index = self.fragmentation_map[data_block_index].next_data_block_index
-                    block_entry_index = block_entry.next_block_entry_index
+        for idx in file_indices:
+            block_entry_index = self.directory_map_entries[idx].first_block_index
+            while block_entry_index != self.data_block_header.block_count:
+                block_entry = self.block_entries[block_entry_index]
+                remaining = block_entry.file_data_size
+                data_block_index = block_entry.first_data_block_index
+                while remaining > 0 and data_block_index < terminator:
+                    mapping[data_block_index] = next_index
+                    block_owner[next_index] = idx
+                    next_index += 1
+                    remaining -= block_size
+                    data_block_index = self.fragmentation_map[
+                        data_block_index
+                    ].next_data_block_index
+                block_entry_index = block_entry.next_block_entry_index
 
-        # ------------------------------------------------------------------
-        # Read all used data blocks into memory then write them sequentially.
-        # ------------------------------------------------------------------
-        block_size = self.data_block_header.block_size
         first_block_offset = self.data_block_header.first_block_offset
-        data_cache: dict[int, bytes] = {}
-        for old_index in sorted(mapping):
-            self.stream.seek(first_block_offset + old_index * block_size)
-            data_cache[old_index] = self.stream.read(block_size)
 
-        for old_index, new_index in mapping.items():
-            if old_index == new_index:
+        visited: set[int] = set()
+        processed_targets: set[int] = set()
+        remaining_blocks = dict(file_block_counts)
+        remaining_files = set(file_indices)
+        files_defragmented = 0
+        bytes_defragmented = 0
+        cancelled = False
+
+        def report(file_index: int | None) -> None:
+            nonlocal files_defragmented, bytes_defragmented, cancelled
+            if file_index is not None:
+                remaining_blocks[file_index] -= 1
+                if remaining_blocks[file_index] == 0:
+                    remaining_files.discard(file_index)
+                files_defragmented = files_total - len(remaining_files)
+            bytes_defragmented += block_size
+            if progress and not progress(
+                self.directory_items[file_index] if file_index is not None else None,
+                files_defragmented,
+                files_total,
+                bytes_defragmented,
+                bytes_total,
+            ):
+                cancelled = True
+
+        for start in list(mapping.keys()):
+            if cancelled:
+                break
+            if start in visited or mapping[start] == start:
                 continue
-            self.stream.seek(first_block_offset + new_index * block_size)
-            self.stream.write(data_cache[old_index])
+            current = start
+            self.stream.seek(first_block_offset + current * block_size)
+            temp = self.stream.read(block_size)
+            while True:
+                target = mapping[current]
+                visited.add(current)
+                offset = first_block_offset + target * block_size
+                self.stream.seek(offset)
+                if target in visited or mapping.get(target, target) == target:
+                    self.stream.write(temp)
+                    processed_targets.add(target)
+                    report(block_owner[target])
+                    break
+                next_temp = self.stream.read(block_size)
+                self.stream.seek(offset)
+                self.stream.write(temp)
+                processed_targets.add(target)
+                report(block_owner[target])
+                temp = next_temp
+                current = target
 
-        # ------------------------------------------------------------------
-        # Rebuild block entries and the fragmentation map using the new layout
-        # ------------------------------------------------------------------
+        if cancelled:
+            for old in mapping.keys():
+                if old not in visited:
+                    mapping[old] = old
+
+        if not cancelled:
+            for old, new in mapping.items():
+                if old == new:
+                    report(block_owner[new])
+                    if cancelled:
+                        break
+
         block_count = self.fragmentation_map_header.block_count
         new_fragmentation_map = [
             GCFFragmentationMap(block_count) for _ in range(block_count)
         ]
 
-        for i, entry in enumerate(self.directory_entries):
-            if entry.directory_flags & HL_GCF_FLAG_FILE:
-                block_entry_index = self.directory_map_entries[i].first_block_index
-                while block_entry_index != self.data_block_header.block_count:
-                    block_entry = self.block_entries[block_entry_index]
-                    remaining = block_entry.file_data_size
-                    first_old = block_entry.first_data_block_index
-                    block_entry.first_data_block_index = mapping[first_old]
+        for idx in file_indices:
+            block_entry_index = self.directory_map_entries[idx].first_block_index
+            while block_entry_index != self.data_block_header.block_count:
+                block_entry = self.block_entries[block_entry_index]
+                remaining = block_entry.file_data_size
+                first_old = block_entry.first_data_block_index
+                block_entry.first_data_block_index = mapping[first_old]
 
-                    data_block_index = first_old
-                    while remaining > 0 and data_block_index < terminator:
-                        new_index = mapping[data_block_index]
-                        next_old = self.fragmentation_map[data_block_index].next_data_block_index
-                        if remaining <= self.data_block_header.block_size or next_old >= terminator:
-                            new_next = terminator
-                        else:
-                            new_next = mapping[next_old]
-                        new_fragmentation_map[new_index].next_data_block_index = new_next
-                        data_block_index = next_old
-                        remaining -= self.data_block_header.block_size
+                data_block_index = first_old
+                while remaining > 0 and data_block_index < terminator:
+                    new_index = mapping[data_block_index]
+                    next_old = self.fragmentation_map[
+                        data_block_index
+                    ].next_data_block_index
+                    if remaining <= block_size or next_old >= terminator:
+                        new_next = terminator
+                    else:
+                        new_next = mapping[next_old]
+                    new_fragmentation_map[new_index].next_data_block_index = new_next
+                    data_block_index = next_old
+                    remaining -= block_size
 
-                    block_entry_index = block_entry.next_block_entry_index
+                block_entry_index = block_entry.next_block_entry_index
 
+        next_index = max(mapping.values(), default=0) + 1
         for i in range(next_index, block_count):
             new_fragmentation_map[i].next_data_block_index = block_count
 
@@ -740,9 +815,6 @@ class GCFFile:
             + self.fragmentation_map_header.terminator
         ) & 0xFFFFFFFF
 
-        # ------------------------------------------------------------------
-        # Write updated tables back to the stream.
-        # ------------------------------------------------------------------
         block_entries_offset = 44 + 32
         frag_header_offset = (
             block_entries_offset
@@ -782,7 +854,7 @@ class GCFFile:
 
         self.stream.flush()
 
-        return True
+        return not cancelled
 
     # ------------------------------------------------------------------
     # Step 5: File data access and validation
