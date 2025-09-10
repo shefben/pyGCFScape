@@ -960,13 +960,24 @@ class CacheFileBlockAllocationTableEntry:
             value._next_block_index = self.index
 
     def _get_first_sector(self):
+        """Return the first sector for this block or ``None`` if unused."""
+        alloc_table = self.owner.owner.alloc_table
+        # Block entries that do not reference any data use a sentinel index
+        # equal to the allocation table's terminator value.  Creating a
+        # ``CacheFileSector`` for these entries would attempt to index past the
+        # end of the allocation table and raise ``IndexError``.
+        if self._first_sector_index >= alloc_table.terminator:
+            return None
         return CacheFileSector(self, self._first_sector_index)
 
     def _set_first_sector(self, value):
         self._first_sector_index = value.inde
 
     def _get_is_fragmented(self):
-        return (self.owner.owner.alloc_table[self._first_sector_index] - self._first_sector_index) != -1
+        alloc_table = self.owner.owner.alloc_table
+        if self._first_sector_index >= alloc_table.terminator:
+            return False
+        return (alloc_table[self._first_sector_index] - self._first_sector_index) != -1
 
     next_block = property(_get_next_block, _set_next_block)
     prev_block = property(_get_prev_block, _set_prev_block)
@@ -1438,13 +1449,27 @@ class CacheFileSectorHeader:
             raise ValueError(
                 "Invalid Cache File Sector Header [SectorSize mismatch]"
             )
-        if self.checksum != self.calculate_checksum():
+        # Some early (v1) GCF files are known to store an invalid checksum in
+        # the data header.  HLLib ignores this discrepancy, so we only enforce
+        # checksum validation for newer format revisions.
+        if self.format_version > 1 and self.checksum != self.calculate_checksum():
             raise ValueError(
                 "Invalid Cache File Sector Header [Checksum mismatch]"
             )
 
     def calculate_checksum(self):
-        return self.sector_count + self.sector_size + self.first_sector_offset + self.sectors_used
+        # The checksum stored in the data header is a 32-bit unsigned sum of
+        # the following fields.  Clamp intermediate results to 32 bits to match
+        # the behavior of the original C++ implementation.
+        checksum = 0
+        for value in (
+            self.sector_count,
+            self.sector_size,
+            self.first_sector_offset,
+            self.sectors_used,
+        ):
+            checksum = (checksum + value) & 0xFFFFFFFF
+        return checksum
 
 class CacheFileSector:
 
