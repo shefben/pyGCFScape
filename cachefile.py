@@ -900,7 +900,20 @@ class GCFFile:
 
         return GCFStream(self, file_index)
 
-    def validate_file(self, file_index: int) -> str:
+    def validate_file(
+        self,
+        file_index: int,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> str:
+        """Validate a single file within the archive.
+
+        File data is streamed from the underlying cache using :class:`GCFStream`
+        to avoid loading the entire contents into memory.  Checksums are
+        computed per chunk and compared against the stored checksum table.  The
+        optional ``progress`` callback is invoked after each chunk is processed
+        with ``(bytes_processed, total_bytes)``.
+        """
+
         entry = self.directory_entries[file_index]
 
         # Ensure we have all data blocks required for the file.
@@ -917,16 +930,33 @@ class GCFFile:
         if entry.checksum_index == 0xFFFFFFFF or not self.checksum_map_entries:
             return "assumed-ok"
 
-        data = self.read_file(file_index)
-        map_entry = self.checksum_map_entries[entry.checksum_index]
-        for i in range(map_entry.checksum_count):
-            start = i * HL_GCF_CHECKSUM_LENGTH
-            end = start + HL_GCF_CHECKSUM_LENGTH
-            chunk = data[start:end]
-            checksum = (zlib.adler32(chunk) ^ binascii.crc32(chunk)) & 0xFFFFFFFF
-            stored = self.checksum_entries[map_entry.first_checksum_index + i].checksum
-            if checksum != stored:
-                return "corrupt"
+        stream = self.open_stream(file_index)
+        try:
+            map_entry = self.checksum_map_entries[entry.checksum_index]
+            remaining = entry.item_size
+            total = entry.item_size
+            processed = 0
+            i = 0
+            while remaining > 0 and i < map_entry.checksum_count:
+                to_read = min(HL_GCF_CHECKSUM_LENGTH, remaining)
+                chunk = stream.read(to_read)
+                if len(chunk) != to_read:
+                    return "incomplete"
+                checksum = (zlib.adler32(chunk) ^ binascii.crc32(chunk)) & 0xFFFFFFFF
+                stored = self.checksum_entries[map_entry.first_checksum_index + i].checksum
+                if checksum != stored:
+                    return "corrupt"
+                remaining -= to_read
+                processed += to_read
+                i += 1
+                if progress:
+                    progress(processed, total)
+
+            if remaining > 0 or i != map_entry.checksum_count:
+                return "incomplete"
+        finally:
+            stream.close()
+
         return "ok"
 
     # ------------------------------------------------------------------
