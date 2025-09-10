@@ -960,13 +960,24 @@ class CacheFileBlockAllocationTableEntry:
             value._next_block_index = self.index
 
     def _get_first_sector(self):
+        """Return the first sector for this block or ``None`` if unused."""
+        alloc_table = self.owner.owner.alloc_table
+        # Block entries that do not reference any data use a sentinel index
+        # equal to the allocation table's terminator value.  Creating a
+        # ``CacheFileSector`` for these entries would attempt to index past the
+        # end of the allocation table and raise ``IndexError``.
+        if self._first_sector_index >= alloc_table.terminator:
+            return None
         return CacheFileSector(self, self._first_sector_index)
 
     def _set_first_sector(self, value):
         self._first_sector_index = value.inde
 
     def _get_is_fragmented(self):
-        return (self.owner.owner.alloc_table[self._first_sector_index] - self._first_sector_index) != -1
+        alloc_table = self.owner.owner.alloc_table
+        if self._first_sector_index >= alloc_table.terminator:
+            return False
+        return (alloc_table[self._first_sector_index] - self._first_sector_index) != -1
 
     next_block = property(_get_next_block, _set_next_block)
     prev_block = property(_get_prev_block, _set_prev_block)
