@@ -822,6 +822,12 @@ class GCFFile:
             block_entry_index = block_entry.next_block_entry_index
         return bytes(output[: entry.item_size])
 
+    def open_stream(self, file_index: int) -> "GCFStream":
+        """Return a :class:`GCFStream` for the given file index."""
+        from gcfstream import GCFStream
+
+        return GCFStream(self, file_index)
+
     def validate_file(self, file_index: int) -> str:
         entry = self.directory_entries[file_index]
 
