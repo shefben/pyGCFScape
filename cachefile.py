@@ -970,7 +970,7 @@ class GCFFile:
     def validate_file(
         self,
         file_index: int,
-        progress: Callable[[int, int], None] | None = None,
+        progress: Callable[[int, int], bool] | None = None,
     ) -> str:
         """Validate a single file within the archive.
 
@@ -978,7 +978,8 @@ class GCFFile:
         to avoid loading the entire contents into memory.  Checksums are
         computed per chunk and compared against the stored checksum table.  The
         optional ``progress`` callback is invoked after each chunk is processed
-        with ``(bytes_processed, total_bytes)``.
+        with ``(bytes_processed, total_bytes)`` and should return ``True`` to
+        continue or ``False`` to cancel the operation.
         """
 
         entry = self.directory_entries[file_index]
@@ -1016,8 +1017,8 @@ class GCFFile:
                 remaining -= to_read
                 processed += to_read
                 i += 1
-                if progress:
-                    progress(processed, total)
+                if progress and not progress(processed, total):
+                    return "cancelled"
 
             if remaining > 0 or i != map_entry.checksum_count:
                 return "incomplete"
