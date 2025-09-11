@@ -10,6 +10,9 @@ def test_build_round_trip(tmp_path):
     cf.convert_version(6, out)
     rebuilt = CacheFile.parse(out)
     assert "hello.txt" in rebuilt.root.items
+    assert rebuilt.header.sector_size == 0x2000
+    assert rebuilt.manifest.compression_block_size == 0x2000
+    assert out.stat().st_size == rebuilt.header.file_size
     f = rebuilt.root["hello.txt"].open("rb")
     try:
         assert f.read() == b"hello world"
@@ -20,6 +23,9 @@ def test_build_round_trip(tmp_path):
     cf.convert_version(1, out_v1)
     rebuilt_v1 = CacheFile.parse(out_v1)
     assert "hello.txt" in rebuilt_v1.root.items
+    assert rebuilt_v1.header.sector_size == 0x2000
+    assert rebuilt_v1.manifest.compression_block_size == 0x2000
+    assert out_v1.stat().st_size == rebuilt_v1.header.file_size
     f = rebuilt_v1.root["hello.txt"].open("rb")
     try:
         assert f.read() == b"hello world"

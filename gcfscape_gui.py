@@ -376,17 +376,30 @@ def _completion(entry) -> float:
         manifest = getattr(entry, "_manifest_entry", None)
         if not manifest or total == 0:
             return 100.0
-        avail = sum(b.file_data_size for b in manifest.blocks if b)
+        sector = getattr(getattr(entry.package, "header", None), "sector_size", 0)
+        avail = 0
+        block = manifest.first_block
+        while block is not None:
+            count = sum(1 for _ in block.sectors)
+            avail += min(block.file_data_size, count * sector)
+            block = block.next_block
         return 100.0 * min(1.0, avail / total)
     files = entry.all_files()
     total = sum(f.size() for f in files)
     if total == 0:
         return 100.0
+    sector = getattr(getattr(entry.package, "header", None), "sector_size", 0)
     avail = 0
     for f in files:
         manifest = getattr(f, "_manifest_entry", None)
         if manifest:
-            avail += sum(b.file_data_size for b in manifest.blocks if b)
+            block = manifest.first_block
+            while block is not None:
+                count = sum(1 for _ in block.sectors)
+                avail += min(block.file_data_size, count * sector)
+                block = block.next_block
+        else:
+            avail += f.size()
     return 100.0 * min(1.0, avail / total)
 
 
@@ -1558,45 +1571,52 @@ class GCFScapeWindow(QMainWindow):
         self._enable_edit_actions(True)
 
     def _compile_cache(self) -> None:
-        if not self.is_building_gcf or not isinstance(self.cachefile, ArchivePackage):
+        if not self.cachefile:
             return
         path, _ = QFileDialog.getSaveFileName(self, "Save GCF", "", "GCF Files (*.gcf)")
         if not path:
             return
-        files: dict[str, bytes] = {}
-        flags: dict[str, int] = {}
-
-        def collect(folder):
-            flags[folder.path().lstrip("/")] = getattr(folder, "flags", 0)
-            for name, entry in folder.items.items():
-                if entry.is_folder():
-                    collect(entry)
-                else:
-                    loader = getattr(entry, "_loader", None)
-                    data = b""
-                    if loader and loader[0] == "fs":
-                        with open(loader[1], "rb") as f:
-                            data = f.read()
-                    files[entry.path().lstrip("/")] = data
-                    flags[entry.path().lstrip("/")] = getattr(entry, "flags", 0)
-
-        collect(self.cachefile.root)
-
-        cf = CacheFile.build(files, app_id=self.new_app_id, app_version=self.new_app_version, flags=flags)
-        total = sum(len(d) for d in files.values())
-        total = min(total, 0x7FFFFFFF)
-        progress = QProgressDialog("Compiling…", None, 0, int(total), self)
+        progress = QProgressDialog("Compiling…", None, 0, 0, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
 
         def cb(written, total_bytes):
-            if progress.maximum() != total_bytes:
-                progress.setMaximum(total_bytes)
-            progress.setValue(written)
+            total = min(total_bytes, 0x7FFFFFFF)
+            if progress.maximum() != total:
+                progress.setMaximum(total)
+            progress.setValue(min(written, 0x7FFFFFFF))
             QApplication.processEvents()
 
         try:
-            cf.convert_version(self.new_cache_version, path, progress=cb)
+            if isinstance(self.cachefile, ArchivePackage):
+                files: dict[str, bytes] = {}
+                flags: dict[str, int] = {}
+
+                def collect(folder):
+                    flags[folder.path().lstrip("/")] = getattr(folder, "flags", 0)
+                    for name, entry in folder.items.items():
+                        if entry.is_folder():
+                            collect(entry)
+                        else:
+                            loader = getattr(entry, "_loader", None)
+                            data = b""
+                            if loader and loader[0] == "fs":
+                                with open(loader[1], "rb") as f:
+                                    data = f.read()
+                            files[entry.path().lstrip("/")] = data
+                            flags[entry.path().lstrip("/")] = getattr(entry, "flags", 0)
+
+                collect(self.cachefile.root)
+
+                cf = CacheFile.build(
+                    files,
+                    app_id=self.new_app_id,
+                    app_version=self.new_app_version,
+                    flags=flags,
+                )
+                cf.convert_version(self.new_cache_version, path, progress=cb)
+            else:
+                self.cachefile.save(path, progress=cb)
             QMessageBox.information(self, "Compile", "Compilation completed.")
         except Exception as exc:
             QMessageBox.critical(self, "Compile", f"Compilation failed: {exc}")

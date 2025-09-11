@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover - handled at runtime
     AES = None
 
 CACHE_CHECKSUM_LENGTH = 0x8000
+GCF_DEFAULT_SECTOR_SIZE = 0x2000
 
 
 STEAM_TERMINATOR = "\\"  # Archive path separator
@@ -255,7 +256,7 @@ class CacheFile:
         """
 
         self = cls()
-        sector_size = CACHE_CHECKSUM_LENGTH
+        sector_size = GCF_DEFAULT_SECTOR_SIZE
         self.stream = BytesIO()
         self._stream_owner = True
         self.is_parsed = True
@@ -518,7 +519,7 @@ class CacheFile:
             manifest.header_version = 4  # uiDummy0 constant
             manifest.application_id = header.application_id
             manifest.application_version = header.application_version
-            manifest.compression_block_size = CACHE_CHECKSUM_LENGTH
+            manifest.compression_block_size = header.sector_size
             manifest.hash_table_keys = []
             manifest.hash_table_indices = [0] * manifest.node_count
             manifest.minimum_footprint_entries = []
@@ -608,9 +609,7 @@ class CacheFile:
         data_header_bytes = data_header.serialize()
 
         total_data = data_header.sectors_used * data_header.sector_size
-        header.file_size = (
-            data_header.first_sector_offset + len(data_header_bytes) + total_data
-        )
+        header.file_size = data_header.first_sector_offset + total_data
 
         header_bytes = header.serialize()
 
@@ -1035,7 +1034,7 @@ class CacheFile:
             entry.folder = dest_folder
         dest_folder.items[name] = entry
 
-    def save(self, output_path: str) -> None:
+    def save(self, output_path: str, progress: Callable[[int, int], None] | None = None) -> None:
         files: dict[str, bytes] = {}
         flags: dict[str, int] = {}
 
@@ -1065,7 +1064,7 @@ class CacheFile:
             app_version=self.header.application_version,
             flags=flags,
         )
-        cf.convert_version(self.header.format_version, output_path)
+        cf.convert_version(self.header.format_version, output_path, progress=progress)
 
     # ------------------------------------------------------------------
     def is_fragmented(self) -> bool:
@@ -1082,6 +1081,19 @@ class CacheFile:
         fragmented, _used = self._get_item_fragmentation(0)
         return fragmented > 0
 
+    def _available_bytes(self, manifest_entry) -> int:
+        sector = self.header.sector_size
+        size = 0
+        block = manifest_entry.first_block
+        while block is not None:
+            try:
+                count = sum(1 for _ in block.sectors)
+            except Exception:
+                count = 0
+            size += min(block.file_data_size, count * sector)
+            block = block.next_block
+        return size
+
     # ------------------------------------------------------------------
     def _validate_file(self, entry) -> Optional[str]:
         """Internal helper implementing HLLib's validation routine.
@@ -1093,12 +1105,7 @@ class CacheFile:
 
         manifest_entry = entry._manifest_entry
 
-        # Determine how much data is available by walking the block chain.
-        size = 0
-        block = manifest_entry.first_block
-        while block is not None:
-            size += block.file_data_size
-            block = block.next_block
+        size = self._available_bytes(manifest_entry)
         if size != manifest_entry.item_size:
             return "size mismatch"
 
@@ -1149,6 +1156,46 @@ class CacheFile:
         if not self.is_parsed:
             return ["Cache file not parsed"]
 
+        try:
+            self.header.validate()
+        except Exception as exc:
+            errors.append(f"header: {exc}")
+        if self.is_gcf():
+            if self.manifest:
+                try:
+                    self.manifest.validate()
+                except Exception as exc:
+                    errors.append(f"manifest: {exc}")
+            if self.blocks:
+                try:
+                    self.blocks.validate()
+                except Exception as exc:
+                    errors.append(f"blocks: {exc}")
+            if self.alloc_table:
+                try:
+                    self.alloc_table.validate()
+                except Exception as exc:
+                    errors.append(f"alloc table: {exc}")
+            if self.block_entry_map and hasattr(self.block_entry_map, "validate"):
+                try:
+                    self.block_entry_map.validate()
+                except Exception as exc:
+                    errors.append(f"block entry map: {exc}")
+            if self.data_header:
+                try:
+                    self.data_header.validate()
+                except Exception as exc:
+                    errors.append(f"sector header: {exc}")
+            try:
+                self.stream.seek(0, os.SEEK_END)
+                actual = self.stream.tell()
+                if actual != self.header.file_size:
+                    errors.append(
+                        f"file size mismatch: header {self.header.file_size} actual {actual}"
+                    )
+            finally:
+                self.stream.seek(0)
+
         files = self.root.all_files()
         total = len(files)
 
@@ -1175,11 +1222,7 @@ class CacheFile:
             manifest_entry = getattr(entry, "_manifest_entry", None)
             if not manifest_entry:
                 continue
-            size = 0
-            block = manifest_entry.first_block
-            while block is not None:
-                size += block.file_data_size
-                block = block.next_block
+            size = self._available_bytes(manifest_entry)
             if size >= manifest_entry.item_size:
                 complete += 1
         return complete, len(files)
