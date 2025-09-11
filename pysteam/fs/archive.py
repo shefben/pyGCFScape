@@ -7,6 +7,9 @@ import zipfile
 import tarfile
 import gzip
 import shutil
+import tempfile
+
+import vpk
 from pathlib import Path
 
 from . import DirectoryFile, DirectoryFolder
@@ -229,6 +232,71 @@ class RarArchive(ArchivePackage):
         return self.rar.open(entry._loader)
 
 
+class VpkArchive(ArchivePackage):
+    """Valve VPK package using :mod:`vpk`."""
+
+    def _parse(self) -> None:
+        self.vpk = vpk.VPK(self._path, read_header_only=False)
+        for path in self.vpk:
+            file = self.vpk.get_file(path)
+            self._add_file(path.replace("\\", "/"), file.length, path)
+
+    def _open_file(self, entry, mode="rb", key=None):
+        vfile = self.vpk.get_file(entry._loader)
+        return io.BytesIO(vfile.read())
+
+    # ------------------------------------------------------------------
+    # Editing helpers
+    # ------------------------------------------------------------------
+    def add_file(self, src_path: str, dest_dir: str = "") -> None:
+        name = os.path.basename(src_path)
+        dest_path = self._join_path(dest_dir, name)
+        self._add_file(dest_path, os.path.getsize(src_path), ("fs", src_path))
+
+    def remove_file(self, path: str) -> None:
+        parts = [p for p in path.split("/") if p]
+        folder = self.root
+        for part in parts[:-1]:
+            folder = folder.items.get(part)
+            if folder is None:
+                return
+        folder.items.pop(parts[-1], None)
+
+    def move_file(self, old_path: str, new_path: str) -> None:
+        parts = [p for p in old_path.split("/") if p]
+        folder = self.root
+        for part in parts[:-1]:
+            folder = folder.items.get(part)
+            if folder is None:
+                return
+        entry = folder.items.pop(parts[-1], None)
+        if not entry:
+            return
+        loader = getattr(entry, "_loader", None)
+        size = getattr(entry, "item_size", 0)
+        self._add_file(new_path, size, loader)
+
+    def save(self, output_path: str | None = None) -> None:
+        if output_path is None:
+            output_path = self._path
+        temp_dir = tempfile.mkdtemp()
+        try:
+            for entry in self.root.all_files():
+                dest = os.path.join(temp_dir, entry.path().lstrip("/"))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                loader = getattr(entry, "_loader", None)
+                if isinstance(loader, tuple) and loader and loader[0] == "fs":
+                    shutil.copyfile(loader[1], dest)
+                else:
+                    vfile = self.vpk.get_file(loader)
+                    with open(dest, "wb") as f:
+                        f.write(vfile.read())
+            newvpk = vpk.new(temp_dir)
+            newvpk.save(output_path)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 class XzpArchive(ArchivePackage):
     """Placeholder for Half-Life 2 Xbox XZP archives."""
 
@@ -247,6 +315,7 @@ EXTENSION_MAP = {
     ".7z": SevenZipArchive,
     ".rar": RarArchive,
     ".xzp": XzpArchive,
+    ".vpk": VpkArchive,
 }
 
 

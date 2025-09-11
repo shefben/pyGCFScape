@@ -94,7 +94,7 @@ from PyQt5.QtWidgets import (
 # The pysteam cache file parser is used to read GCF/NCF archives.  It
 # exposes a similar API to the original C++ version used by GCFScape.
 from pysteam.fs.cachefile import CacheFile, CacheFileManifestEntry
-from pysteam.fs.archive import open_archive
+from pysteam.fs.archive import open_archive, VpkArchive
 from pysteam.bsp.preview import BSPViewWidget
 from pysteam.image import ImageViewWidget
 from pysteam.vtf.preview import VTFViewWidget
@@ -205,7 +205,8 @@ class FileListWidget(QTreeWidget):
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setDragEnabled(True)
-        self.setDragDropMode(QAbstractItemView.DragOnly)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
         
     # ------------------------------------------------------------------
     def startDrag(self, supportedActions: Qt.DropActions) -> None:  # type: ignore[override]
@@ -237,6 +238,21 @@ class FileListWidget(QTreeWidget):
         drag.setMimeData(mime)
         drag.exec_(Qt.CopyAction)
         self.window._temp_dirs.append(temp_dir)
+
+    # ------------------------------------------------------------------
+    def dragEnterEvent(self, event):  # type: ignore[override]
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    # ------------------------------------------------------------------
+    def dropEvent(self, event):  # type: ignore[override]
+        if event.mimeData().hasUrls():
+            self.window._add_dropped_files(event.mimeData().urls())
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
 
     # ------------------------------------------------------------------
     def mousePressEvent(self, event):  # type: ignore[override]
@@ -835,6 +851,8 @@ class GCFScapeWindow(QMainWindow):
         self.open_action.triggered.connect(self._open_file)
         self.close_action = QAction("&Close", self)
         self.close_action.triggered.connect(self._close_file)
+        self.save_vpk_action = QAction("&Save", self)
+        self.save_vpk_action.triggered.connect(self._save_vpk)
         self.exit_action = QAction("E&xit", self)
         self.exit_action.triggered.connect(self.close)
 
@@ -842,6 +860,14 @@ class GCFScapeWindow(QMainWindow):
         self.extract_action.triggered.connect(lambda: self._extract_entry(self._current_entry()))
         self.extract_all_action = QAction("Extract &All…", self)
         self.extract_all_action.triggered.connect(self._extract_all)
+
+        self.add_files_action = QAction("Add Files…", self)
+        self.add_files_action.triggered.connect(self._add_files)
+        self.delete_action = QAction("Delete", self)
+        self.delete_action.triggered.connect(self._delete_selected)
+        self.rename_action = QAction("Rename…", self)
+        self.rename_action.triggered.connect(self._rename_selected)
+        self._enable_vpk_actions(False)
 
         self.refresh_action = QAction("&Refresh", self)
         self.refresh_action.triggered.connect(self._refresh)
@@ -885,6 +911,7 @@ class GCFScapeWindow(QMainWindow):
         file_menu = menubar.addMenu("&File")
         file_menu.addAction(self.open_action)
         file_menu.addAction(self.close_action)
+        file_menu.addAction(self.save_vpk_action)
 
         self.recent_menu = file_menu.addMenu("Open &Recent")
         self._rebuild_recent_menu()
@@ -898,6 +925,10 @@ class GCFScapeWindow(QMainWindow):
         edit_menu = menubar.addMenu("&Edit")
         edit_menu.addAction(self.find_action)
         edit_menu.addAction(self.refresh_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.add_files_action)
+        edit_menu.addAction(self.delete_action)
+        edit_menu.addAction(self.rename_action)
 
         view_menu = menubar.addMenu("&View")
         view_menu.addAction(self.expand_action)
@@ -1247,6 +1278,16 @@ class GCFScapeWindow(QMainWindow):
         self._rebuild_recent_menu()
 
     # ------------------------------------------------------------------
+    def _enable_vpk_actions(self, enabled: bool) -> None:
+        for act in (
+            self.add_files_action,
+            self.delete_action,
+            self.rename_action,
+            self.save_vpk_action,
+        ):
+            act.setEnabled(enabled)
+
+    # ------------------------------------------------------------------
     # File operations
     # ------------------------------------------------------------------
 
@@ -1264,7 +1305,7 @@ class GCFScapeWindow(QMainWindow):
     def _load_file(self, path: Path) -> None:
         self._decryption_key = None
         try:
-            if path.suffix.lower() in {".gcf", ".ncf", ".vpk"}:
+            if path.suffix.lower() in {".gcf", ".ncf"}:
                 self.cachefile = CacheFile.parse(path)
             else:
                 self.cachefile = open_archive(path)
@@ -1280,6 +1321,7 @@ class GCFScapeWindow(QMainWindow):
         self.history_index = -1
         self._populate_tree()
         self._update_status_info()
+        self._enable_vpk_actions(isinstance(self.cachefile, VpkArchive))
 
     # ------------------------------------------------------------------
     def _close_file(self) -> None:
@@ -1306,6 +1348,7 @@ class GCFScapeWindow(QMainWindow):
         self.forward_action_nav.setEnabled(False)
         self.up_action_nav.setEnabled(False)
         self._update_status_info()
+        self._enable_vpk_actions(False)
 
     # ------------------------------------------------------------------
     def _refresh(self) -> None:
@@ -1489,6 +1532,18 @@ class GCFScapeWindow(QMainWindow):
         copy_path_action.triggered.connect(lambda: self._copy_text(entry.path()))
         menu.addAction(copy_path_action)
 
+        if isinstance(self.cachefile, VpkArchive):
+            if entry.is_folder():
+                add_act = QAction("Add Files…", self)
+                add_act.triggered.connect(lambda: self._add_files(entry))
+                menu.addAction(add_act)
+            rename_act = QAction("Rename…", self)
+            rename_act.triggered.connect(lambda: self._rename_selected(entry))
+            menu.addAction(rename_act)
+            delete_act = QAction("Delete", self)
+            delete_act.triggered.connect(lambda: self._delete_selected([entry]))
+            menu.addAction(delete_act)
+
         if self._search_mode and widget is self.file_list:
             goto_action = QAction("Go To Directory", self)
             goto_action.triggered.connect(lambda: self._go_to_directory(entry))
@@ -1551,6 +1606,70 @@ class GCFScapeWindow(QMainWindow):
         if not worker.isRunning():
             QMessageBox.information(self, "Extraction complete", f"Extracted to {dest}")
             self._log(f"Extraction complete: {dest}")
+
+    # ------------------------------------------------------------------
+    def _add_files(self, folder=None) -> None:
+        if not isinstance(self.cachefile, VpkArchive):
+            return
+        if folder is None:
+            folder = self._current_directory()
+        if folder is None:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add Files")
+        for path in paths:
+            self.cachefile.add_file(path, folder.path())
+        if paths:
+            self._populate_tree()
+
+    # ------------------------------------------------------------------
+    def _delete_selected(self, entries=None) -> None:
+        if not isinstance(self.cachefile, VpkArchive):
+            return
+        if entries is None:
+            items = [i for i in self.file_list.selectedItems() if isinstance(i, EntryItem)]
+            entries = [i.entry for i in items]
+        for entry in entries:
+            self.cachefile.remove_file(entry.path())
+        if entries:
+            self._populate_tree()
+
+    # ------------------------------------------------------------------
+    def _rename_selected(self, entry=None) -> None:
+        if not isinstance(self.cachefile, VpkArchive):
+            return
+        if entry is None:
+            item = self.file_list.currentItem()
+            if not isinstance(item, EntryItem):
+                return
+            entry = item.entry
+        new_name, ok = QInputDialog.getText(self, "Rename", "New name", text=entry.name)
+        if not ok or not new_name:
+            return
+        new_path = self.cachefile._join_path(entry.folder.path(), new_name)
+        self.cachefile.move_file(entry.path(), new_path)
+        self._populate_tree()
+
+    # ------------------------------------------------------------------
+    def _save_vpk(self) -> None:
+        if not isinstance(self.cachefile, VpkArchive):
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save VPK", self.current_path or "", "VPK Files (*.vpk)")
+        if not path:
+            return
+        self.cachefile.save(path)
+
+    # ------------------------------------------------------------------
+    def _add_dropped_files(self, urls) -> None:
+        if not isinstance(self.cachefile, VpkArchive):
+            return
+        folder = self._current_directory()
+        if folder is None:
+            return
+        for url in urls:
+            path = url.toLocalFile()
+            if os.path.isfile(path):
+                self.cachefile.add_file(path, folder.path())
+        self._populate_tree()
 
     # ------------------------------------------------------------------
     def _get_decryption_key(self) -> bytes | None:
@@ -1671,7 +1790,10 @@ class GCFScapeWindow(QMainWindow):
                 self.cachefile.data_header.sectors_used
                 * self.cachefile.data_header.sector_size
             )
-        progress = QProgressDialog("Converting…", None, 0, total, self)
+        # ``QProgressDialog`` accepts only 32-bit signed integers.  Clamp the
+        # range so extremely large archives don't overflow the limit.
+        total = min(total, 0x7FFFFFFF)
+        progress = QProgressDialog("Converting…", None, 0, int(total), self)
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
 
