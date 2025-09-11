@@ -6,3 +6,4 @@ pyqtgraph>=0.13
 PyOpenGL>=3.1
 py7zr>=0.20
 rarfile>=4.0
+vpk>=1.4
