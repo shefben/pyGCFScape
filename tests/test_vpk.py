@@ -23,3 +23,15 @@ def test_vpk_open_and_edit(tmp_path: Path):
 
     archive2 = open_archive(out_path)
     assert "b.txt" in archive2.root.items
+
+
+def test_vpk_create_new(tmp_path: Path):
+    archive = VpkArchive()
+    new_file = tmp_path / "c.txt"
+    new_file.write_text("data")
+    archive.add_file(str(new_file), "")
+    out = tmp_path / "create.vpk"
+    archive.save(str(out))
+
+    reopened = open_archive(out)
+    assert "c.txt" in reopened.root.items

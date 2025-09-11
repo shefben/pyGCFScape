@@ -240,7 +240,13 @@ class CacheFile:
                 self.stream = None
 
     @classmethod
-    def build(cls, files: dict[str, bytes], app_id: int = 0, app_version: int = 0) -> "CacheFile":
+    def build(
+        cls,
+        files: dict[str, bytes],
+        app_id: int = 0,
+        app_version: int = 0,
+        flags: dict[str, int] | None = None,
+    ) -> "CacheFile":
         """Construct a new :class:`CacheFile` from a mapping of paths to data.
 
         The returned cache file lives in memory using the latest GCF format
@@ -292,6 +298,7 @@ class CacheFile:
         filename_table = bytearray(b"\0")
 
         # Build simple directory tree from mapping.
+        flags = flags or {}
         root: dict[str, object] = {}
         for path, data in files.items():
             parts = [p for p in path.replace("\\", "/").split("/") if p]
@@ -303,7 +310,7 @@ class CacheFile:
         file_nodes: list[tuple[int, bytes]] = []
         checksums: list[int] = []
 
-        def add_entry(obj: object, name: str, parent: int) -> int:
+        def add_entry(obj: object, name: str, parent: int, path: str) -> int:
             index = len(manifest.manifest_entries)
             entry = CacheFileManifestEntry(manifest)
             entry.index = index
@@ -316,12 +323,13 @@ class CacheFile:
                 # Directory
                 entry.item_size = 0
                 entry.checksum_index = 0
-                entry.directory_flags = 0
+                entry.directory_flags = flags.get(path, 0)
                 manifest.manifest_entries.append(entry)
                 manifest.manifest_map_entries.append(0xFFFFFFFF)
                 children: list[int] = []
                 for child_name in sorted(obj):
-                    children.append(add_entry(obj[child_name], child_name, index))
+                    child_path = path + "/" + child_name if path else child_name
+                    children.append(add_entry(obj[child_name], child_name, index, child_path))
                 if children:
                     entry.child_index = children[0]
                     for a, b in zip(children, children[1:]):
@@ -331,14 +339,14 @@ class CacheFile:
                 data = obj  # type: ignore[assignment]
                 entry.item_size = len(data)
                 entry.checksum_index = len(checksums)
-                entry.directory_flags = CacheFileManifestEntry.FLAG_IS_FILE
+                entry.directory_flags = flags.get(path, 0) | CacheFileManifestEntry.FLAG_IS_FILE
                 manifest.manifest_entries.append(entry)
                 manifest.manifest_map_entries.append(0)
                 file_nodes.append((index, data))
                 checksums.append(zlib.crc32(data) & 0xFFFFFFFF)
             return index
 
-        add_entry(root, "", 0xFFFFFFFF)
+        add_entry(root, "", 0xFFFFFFFF, "")
 
         manifest.filename_table = bytes(filename_table)
         manifest.node_count = len(manifest.manifest_entries)
@@ -772,6 +780,7 @@ class CacheFile:
         self.root = DirectoryFolder(self, package=package)
         self.root.index = 0
         self.root._manifest_entry = manifest_entry
+        self.root.flags = manifest_entry.directory_flags
         self._read_directory_table(self.root)
 
     def _read_directory_table(self, folder):
@@ -788,6 +797,7 @@ class CacheFile:
             entry._manifest_entry = manifest_entry
             entry.item_size = manifest_entry.item_size
             entry.index = manifest_entry.index
+            entry.flags = manifest_entry.directory_flags
 
             folder.items[entry.name] = entry
 
@@ -853,11 +863,16 @@ class CacheFile:
     @raise_parse_error
     @raise_ncf_error
     def _size(self, file):
+        if hasattr(file, "item_size"):
+            return file.item_size
         return self.manifest.manifest_entries[file.index].item_size
 
     @raise_parse_error
     @raise_ncf_error
     def _open_file(self, file, mode, key=None):
+        loader = getattr(file, "_loader", None)
+        if isinstance(loader, tuple) and loader[0] == "fs":
+            return open(loader[1], mode)
         return GCFFileStream(file, self, mode, key)
 
     @raise_parse_error
@@ -944,6 +959,113 @@ class CacheFile:
 
     def __getitem__(self, name):
         return self.root[name]
+
+    # Editing support ---------------------------------------------------
+    def _add_file_internal(self, path: str, size: int, loader) -> None:
+        parts = [p for p in path.split(STEAM_TERMINATOR) if p]
+        folder = self.root
+        for part in parts[:-1]:
+            child = folder.items.get(part)
+            if not child:
+                child = DirectoryFolder(folder, part, self)
+                child.flags = 0
+                folder.items[part] = child
+            folder = child
+        name = parts[-1]
+        file_entry = DirectoryFile(folder, name, self)
+        file_entry.item_size = size
+        file_entry._loader = loader
+        file_entry.flags = 0
+        folder.items[name] = file_entry
+
+    def add_file(self, src_path: str, dest_dir: str = "") -> None:
+        name = os.path.basename(src_path)
+        dest_path = self._join_path(dest_dir, name)
+        self._add_file_internal(dest_path, os.path.getsize(src_path), ("fs", src_path))
+
+    def add_folder(self, dest_dir: str, name: str) -> None:
+        path = self._join_path(dest_dir, name)
+        parts = [p for p in path.split(STEAM_TERMINATOR) if p]
+        folder = self.root
+        for part in parts:
+            child = folder.items.get(part)
+            if not child:
+                child = DirectoryFolder(folder, part, self)
+                child.flags = 0
+                folder.items[part] = child
+            folder = child
+
+    def remove_file(self, path: str) -> None:
+        parts = [p for p in path.split(STEAM_TERMINATOR) if p]
+        if not parts:
+            return
+        folder = self.root
+        for part in parts[:-1]:
+            folder = folder.items.get(part)
+            if folder is None:
+                return
+        folder.items.pop(parts[-1], None)
+
+    def move_file(self, old_path: str, new_path: str) -> None:
+        old_parts = [p for p in old_path.split(STEAM_TERMINATOR) if p]
+        if not old_parts:
+            return
+        folder = self.root
+        for part in old_parts[:-1]:
+            folder = folder.items.get(part)
+            if folder is None:
+                return
+        entry = folder.items.pop(old_parts[-1], None)
+        if not entry:
+            return
+        dest_parts = [p for p in new_path.split(STEAM_TERMINATOR) if p]
+        dest_folder = self.root
+        for part in dest_parts[:-1]:
+            child = dest_folder.items.get(part)
+            if not child:
+                child = DirectoryFolder(dest_folder, part, self)
+                child.flags = 0
+                dest_folder.items[part] = child
+            dest_folder = child
+        name = dest_parts[-1]
+        entry.name = name
+        if isinstance(entry, DirectoryFolder):
+            entry.owner = dest_folder
+        else:
+            entry.folder = dest_folder
+        dest_folder.items[name] = entry
+
+    def save(self, output_path: str) -> None:
+        files: dict[str, bytes] = {}
+        flags: dict[str, int] = {}
+
+        def collect(folder: DirectoryFolder):
+            flags[folder.path().lstrip(STEAM_TERMINATOR).replace(STEAM_TERMINATOR, "/")] = getattr(folder, "flags", 0)
+            for entry in folder.items.values():
+                if entry.is_folder():
+                    collect(entry)
+                else:
+                    loader = getattr(entry, "_loader", None)
+                    if isinstance(loader, tuple) and loader[0] == "fs":
+                        with open(loader[1], "rb") as f:
+                            data = f.read()
+                    else:
+                        stream = self._open_file(entry, "rb")
+                        data = stream.readall()
+                        stream.close()
+                    key = entry.path().lstrip(STEAM_TERMINATOR).replace(STEAM_TERMINATOR, "/")
+                    files[key] = data
+                    flags[key] = getattr(entry, "flags", 0)
+
+        collect(self.root)
+
+        cf = CacheFile.build(
+            files,
+            app_id=self.header.application_id,
+            app_version=self.header.application_version,
+            flags=flags,
+        )
+        cf.convert_version(self.header.format_version, output_path)
 
     # ------------------------------------------------------------------
     def is_fragmented(self) -> bool:

@@ -53,7 +53,15 @@ from PyQt5.QtCore import (
     QModelIndex,
     QPoint,
 )
-from PyQt5.QtGui import QIcon, QCloseEvent, QPixmap, QDesktopServices, QDrag, QMouseEvent
+from PyQt5.QtGui import (
+    QIcon,
+    QCloseEvent,
+    QPixmap,
+    QDesktopServices,
+    QDrag,
+    QMouseEvent,
+    QIntValidator,
+)
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -89,12 +97,14 @@ from PyQt5.QtWidgets import (
     QDockWidget,
     QFrame,
     QListView,
+    QRadioButton,
+    QButtonGroup,
 )
 
 # The pysteam cache file parser is used to read GCF/NCF archives.  It
 # exposes a similar API to the original C++ version used by GCFScape.
 from pysteam.fs.cachefile import CacheFile, CacheFileManifestEntry
-from pysteam.fs.archive import open_archive, VpkArchive
+from pysteam.fs.archive import open_archive, VpkArchive, ArchivePackage
 from pysteam.bsp.preview import BSPViewWidget
 from pysteam.image import ImageViewWidget
 from pysteam.vtf.preview import VTFViewWidget
@@ -586,6 +596,47 @@ class OptionsDialog(QDialog):
         super().accept()
 
 
+class NewCacheDialog(QDialog):
+    """Dialog gathering parameters for a new cache archive."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("New Cache")
+
+        layout = QVBoxLayout(self)
+        self.version_group = QButtonGroup(self)
+        version_layout = QHBoxLayout()
+        for ver in (1, 3, 5, 6):
+            rb = QRadioButton(f"Version {ver}")
+            self.version_group.addButton(rb, ver)
+            version_layout.addWidget(rb)
+        # Default to latest
+        self.version_group.buttons()[-1].setChecked(True)
+        layout.addLayout(version_layout)
+
+        form = QFormLayout()
+        self.app_version_edit = QLineEdit()
+        self.app_version_edit.setValidator(QIntValidator(0, 2 ** 31 - 1, self))
+        form.addRow("Application Version", self.app_version_edit)
+        self.app_id_edit = QLineEdit()
+        self.app_id_edit.setValidator(QIntValidator(0, 2 ** 31 - 1, self))
+        form.addRow("Application/Depot ID", self.app_id_edit)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_version(self) -> int:
+        return self.version_group.checkedId()
+
+    def application_version(self) -> int:
+        return int(self.app_version_edit.text() or "0")
+
+    def application_id(self) -> int:
+        return int(self.app_id_edit.text() or "0")
+
 class PreviewWidget(QWidget):
     """Widget displaying a preview of the currently selected file."""
 
@@ -717,6 +768,7 @@ class GCFScapeWindow(QMainWindow):
         self.cachefile: CacheFile | None = None
         self.current_path: Path | None = None
         self._decryption_key: bytes | None = None
+        self.is_building_gcf = False
         self.entry_to_tree_item: dict = {}
         self.history: List = []
         self.history_index = -1
@@ -746,6 +798,7 @@ class GCFScapeWindow(QMainWindow):
         self.tree.customContextMenuRequested.connect(self._open_context_menu)
         self.tree.itemSelectionChanged.connect(self._update_file_list)
         self.tree.itemSelectionChanged.connect(self._update_preview)
+        self.tree.itemSelectionChanged.connect(self._update_edit_actions)
         left_layout.addWidget(self.tree)
 
         self.file_list = FileListWidget(self)
@@ -766,6 +819,7 @@ class GCFScapeWindow(QMainWindow):
         self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.file_list.customContextMenuRequested.connect(self._open_context_menu)
         self.file_list.itemSelectionChanged.connect(self._update_preview)
+        self.file_list.itemSelectionChanged.connect(self._update_edit_actions)
         self.file_list.itemDoubleClicked.connect(self._file_list_double_clicked)
         self.file_list.setSortingEnabled(True)
         header = self.file_list.header()
@@ -847,12 +901,16 @@ class GCFScapeWindow(QMainWindow):
         # Actions
         # ------------------------------------------------------------------
 
+        self.new_cache_action = QAction("&New Cache…", self)
+        self.new_cache_action.triggered.connect(self._new_cache)
+        self.new_vpk_action = QAction("New &VPK…", self)
+        self.new_vpk_action.triggered.connect(self._new_vpk)
         self.open_action = QAction("&Open…", self)
         self.open_action.triggered.connect(self._open_file)
         self.close_action = QAction("&Close", self)
         self.close_action.triggered.connect(self._close_file)
-        self.save_vpk_action = QAction("&Save", self)
-        self.save_vpk_action.triggered.connect(self._save_vpk)
+        self.save_action = QAction("&Save", self)
+        self.save_action.triggered.connect(self._save_archive)
         self.exit_action = QAction("E&xit", self)
         self.exit_action.triggered.connect(self.close)
 
@@ -863,11 +921,30 @@ class GCFScapeWindow(QMainWindow):
 
         self.add_files_action = QAction("Add Files…", self)
         self.add_files_action.triggered.connect(self._add_files)
+        self.new_folder_action = QAction("New Folder…", self)
+        self.new_folder_action.triggered.connect(self._create_folder)
         self.delete_action = QAction("Delete", self)
         self.delete_action.triggered.connect(self._delete_selected)
         self.rename_action = QAction("Rename…", self)
         self.rename_action.triggered.connect(self._rename_selected)
-        self._enable_vpk_actions(False)
+        flag_defs = [
+            ("Executable", CacheFileManifestEntry.FLAG_IS_EXECUTABLE),
+            ("Hidden", CacheFileManifestEntry.FLAG_IS_HIDDEN),
+            ("Read Only", CacheFileManifestEntry.FLAG_IS_READ_ONLY),
+            ("Encrypted", CacheFileManifestEntry.FLAG_IS_ENCRYPTED),
+            ("Purge", CacheFileManifestEntry.FLAG_IS_PURGE_FILE),
+            ("Backup Before Overwrite", CacheFileManifestEntry.FLAG_BACKUP_PLZ),
+            ("No Cache", CacheFileManifestEntry.FLAG_IS_NO_CACHE),
+            ("Locked", CacheFileManifestEntry.FLAG_IS_LOCKED),
+            ("Launch", CacheFileManifestEntry.FLAG_IS_LAUNCH),
+            ("Configuration", CacheFileManifestEntry.FLAG_IS_USER_CONFIG),
+        ]
+        self.flag_actions = {}
+        for text, bit in flag_defs:
+            act = QAction(text, self, checkable=True)
+            act.toggled.connect(lambda checked, b=bit: self._toggle_flag(b, checked))
+            self.flag_actions[bit] = act
+        self._enable_edit_actions(False)
 
         self.refresh_action = QAction("&Refresh", self)
         self.refresh_action.triggered.connect(self._refresh)
@@ -909,9 +986,11 @@ class GCFScapeWindow(QMainWindow):
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("&File")
+        file_menu.addAction(self.new_cache_action)
+        file_menu.addAction(self.new_vpk_action)
         file_menu.addAction(self.open_action)
         file_menu.addAction(self.close_action)
-        file_menu.addAction(self.save_vpk_action)
+        file_menu.addAction(self.save_action)
 
         self.recent_menu = file_menu.addMenu("Open &Recent")
         self._rebuild_recent_menu()
@@ -923,12 +1002,13 @@ class GCFScapeWindow(QMainWindow):
         file_menu.addAction(self.exit_action)
 
         edit_menu = menubar.addMenu("&Edit")
-        edit_menu.addAction(self.find_action)
-        edit_menu.addAction(self.refresh_action)
-        edit_menu.addSeparator()
         edit_menu.addAction(self.add_files_action)
-        edit_menu.addAction(self.delete_action)
+        edit_menu.addAction(self.new_folder_action)
         edit_menu.addAction(self.rename_action)
+        edit_menu.addAction(self.delete_action)
+        self.flags_menu = edit_menu.addMenu("Flags")
+        for act in self.flag_actions.values():
+            self.flags_menu.addAction(act)
 
         view_menu = menubar.addMenu("&View")
         view_menu.addAction(self.expand_action)
@@ -986,6 +1066,11 @@ class GCFScapeWindow(QMainWindow):
         help_menu = menubar.addMenu("&Help")
         help_menu.addAction(self.about_action)
         help_menu.addAction(self.about_qt_action)
+
+        self.compile_action = QAction("&Compile", self)
+        self.compile_action.triggered.connect(self._compile_cache)
+        self.compile_action.setEnabled(False)
+        menubar.addAction(self.compile_action)
 
         # ------------------------------------------------------------------
         # Toolbar mirroring the File menu
@@ -1060,6 +1145,56 @@ class GCFScapeWindow(QMainWindow):
         if isinstance(item, EntryItem):
             return item.entry
         return None
+
+    def _selected_entries(self):
+        entries = []
+        for item in self.tree.selectedItems():
+            if isinstance(item, EntryItem):
+                entries.append(item.entry)
+        for item in self.file_list.selectedItems():
+            if isinstance(item, EntryItem) and item.entry not in entries:
+                entries.append(item.entry)
+        return entries
+
+    def _update_edit_actions(self) -> None:
+        if not hasattr(self.cachefile, "add_file"):
+            self.rename_action.setEnabled(False)
+            self.delete_action.setEnabled(False)
+            if hasattr(self, "flags_menu"):
+                self.flags_menu.setEnabled(False)
+            return
+        entries = self._selected_entries()
+        self.rename_action.setEnabled(len(entries) == 1)
+        self.delete_action.setEnabled(bool(entries))
+        if hasattr(self, "flags_menu"):
+            self.flags_menu.setEnabled(bool(entries))
+        if not entries:
+            for act in self.flag_actions.values():
+                act.blockSignals(True)
+                act.setChecked(False)
+                act.blockSignals(False)
+            return
+        common = None
+        for e in entries:
+            common = (
+                getattr(e, "flags", 0)
+                if common is None
+                else common & getattr(e, "flags", 0)
+            )
+        for bit, act in self.flag_actions.items():
+            act.blockSignals(True)
+            act.setChecked(bool(common & bit) if common is not None else False)
+            act.blockSignals(False)
+
+    def _toggle_flag(self, bit: int, checked: bool) -> None:
+        entries = self._selected_entries()
+        for e in entries:
+            current = getattr(e, "flags", 0)
+            if checked:
+                current |= bit
+            else:
+                current &= ~bit
+            e.flags = current
 
     def _update_status_info(self) -> None:
         if not self.cachefile or not self.current_path:
@@ -1278,14 +1413,17 @@ class GCFScapeWindow(QMainWindow):
         self._rebuild_recent_menu()
 
     # ------------------------------------------------------------------
-    def _enable_vpk_actions(self, enabled: bool) -> None:
+    def _enable_edit_actions(self, enabled: bool) -> None:
         for act in (
             self.add_files_action,
+            self.new_folder_action,
             self.delete_action,
             self.rename_action,
-            self.save_vpk_action,
         ):
             act.setEnabled(enabled)
+        self.save_action.setEnabled(enabled and hasattr(self.cachefile, "save"))
+        if hasattr(self, "flags_menu"):
+            self.flags_menu.setEnabled(False)
 
     # ------------------------------------------------------------------
     # File operations
@@ -1321,7 +1459,9 @@ class GCFScapeWindow(QMainWindow):
         self.history_index = -1
         self._populate_tree()
         self._update_status_info()
-        self._enable_vpk_actions(isinstance(self.cachefile, VpkArchive))
+        self.is_building_gcf = False
+        self.compile_action.setEnabled(False)
+        self._enable_edit_actions(hasattr(self.cachefile, "add_file"))
 
     # ------------------------------------------------------------------
     def _close_file(self) -> None:
@@ -1339,6 +1479,9 @@ class GCFScapeWindow(QMainWindow):
         self._decryption_key = None
         self.statusBar().clearMessage()
         self.entry_to_tree_item.clear()
+        self.is_building_gcf = False
+        self.compile_action.setEnabled(False)
+        self._enable_edit_actions(False)
         self.history.clear()
         self.history_index = -1
         for d in self._temp_dirs:
@@ -1348,8 +1491,81 @@ class GCFScapeWindow(QMainWindow):
         self.forward_action_nav.setEnabled(False)
         self.up_action_nav.setEnabled(False)
         self._update_status_info()
-        self._enable_vpk_actions(False)
+        self._enable_edit_actions(False)
 
+    def _new_cache(self) -> None:
+        dialog = NewCacheDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.cachefile = ArchivePackage()
+        self.current_path = None
+        self.new_cache_version = dialog.selected_version()
+        self.new_app_version = dialog.application_version()
+        self.new_app_id = dialog.application_id()
+        self.is_building_gcf = True
+        self.history.clear()
+        self.history_index = -1
+        self._populate_tree()
+        self._update_status_info()
+        self.compile_action.setEnabled(True)
+        self._enable_edit_actions(True)
+
+    def _new_vpk(self) -> None:
+        self.cachefile = VpkArchive()
+        self.current_path = None
+        self.is_building_gcf = False
+        self.history.clear()
+        self.history_index = -1
+        self._populate_tree()
+        self._update_status_info()
+        self.compile_action.setEnabled(False)
+        self._enable_edit_actions(True)
+
+    def _compile_cache(self) -> None:
+        if not self.is_building_gcf or not isinstance(self.cachefile, ArchivePackage):
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save GCF", "", "GCF Files (*.gcf)")
+        if not path:
+            return
+        files: dict[str, bytes] = {}
+        flags: dict[str, int] = {}
+
+        def collect(folder):
+            flags[folder.path().lstrip("/")] = getattr(folder, "flags", 0)
+            for name, entry in folder.items.items():
+                if entry.is_folder():
+                    collect(entry)
+                else:
+                    loader = getattr(entry, "_loader", None)
+                    data = b""
+                    if loader and loader[0] == "fs":
+                        with open(loader[1], "rb") as f:
+                            data = f.read()
+                    files[entry.path().lstrip("/")] = data
+                    flags[entry.path().lstrip("/")] = getattr(entry, "flags", 0)
+
+        collect(self.cachefile.root)
+
+        cf = CacheFile.build(files, app_id=self.new_app_id, app_version=self.new_app_version, flags=flags)
+        total = sum(len(d) for d in files.values())
+        total = min(total, 0x7FFFFFFF)
+        progress = QProgressDialog("Compiling…", None, 0, int(total), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        def cb(written, total_bytes):
+            if progress.maximum() != total_bytes:
+                progress.setMaximum(total_bytes)
+            progress.setValue(written)
+            QApplication.processEvents()
+
+        try:
+            cf.convert_version(self.new_cache_version, path, progress=cb)
+            QMessageBox.information(self, "Compile", "Compilation completed.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Compile", f"Compilation failed: {exc}")
+        finally:
+            progress.close()
     # ------------------------------------------------------------------
     def _refresh(self) -> None:
         if self.cachefile:
@@ -1385,6 +1601,7 @@ class GCFScapeWindow(QMainWindow):
         self._update_file_list()
         self.tree.collapseAll()
         self._filter_tree(self.search.text())
+        self._update_edit_actions()
 
     def _current_directory(self):
         item = self.tree.currentItem()
@@ -1532,7 +1749,7 @@ class GCFScapeWindow(QMainWindow):
         copy_path_action.triggered.connect(lambda: self._copy_text(entry.path()))
         menu.addAction(copy_path_action)
 
-        if isinstance(self.cachefile, VpkArchive):
+        if hasattr(self.cachefile, "add_file"):
             if entry.is_folder():
                 add_act = QAction("Add Files…", self)
                 add_act.triggered.connect(lambda: self._add_files(entry))
@@ -1609,7 +1826,7 @@ class GCFScapeWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _add_files(self, folder=None) -> None:
-        if not isinstance(self.cachefile, VpkArchive):
+        if not hasattr(self.cachefile, "add_file"):
             return
         if folder is None:
             folder = self._current_directory()
@@ -1621,12 +1838,25 @@ class GCFScapeWindow(QMainWindow):
         if paths:
             self._populate_tree()
 
+    def _create_folder(self) -> None:
+        if not hasattr(self.cachefile, "add_folder"):
+            return
+        folder = self._current_directory()
+        if folder is None:
+            return
+        name, ok = QInputDialog.getText(self, "New Folder", "Folder name")
+        if not ok or not name:
+            return
+        self.cachefile.add_folder(folder.path(), name)
+        self._populate_tree()
+
     # ------------------------------------------------------------------
     def _delete_selected(self, entries=None) -> None:
-        if not isinstance(self.cachefile, VpkArchive):
+        if not hasattr(self.cachefile, "remove_file"):
             return
         if entries is None:
             items = [i for i in self.file_list.selectedItems() if isinstance(i, EntryItem)]
+            items += [i for i in self.tree.selectedItems() if isinstance(i, EntryItem)]
             entries = [i.entry for i in items]
         for entry in entries:
             self.cachefile.remove_file(entry.path())
@@ -1635,12 +1865,14 @@ class GCFScapeWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _rename_selected(self, entry=None) -> None:
-        if not isinstance(self.cachefile, VpkArchive):
+        if not hasattr(self.cachefile, "move_file"):
             return
         if entry is None:
             item = self.file_list.currentItem()
             if not isinstance(item, EntryItem):
-                return
+                item = self.tree.currentItem()
+                if not isinstance(item, EntryItem):
+                    return
             entry = item.entry
         new_name, ok = QInputDialog.getText(self, "Rename", "New name", text=entry.name)
         if not ok or not new_name:
@@ -1650,17 +1882,24 @@ class GCFScapeWindow(QMainWindow):
         self._populate_tree()
 
     # ------------------------------------------------------------------
-    def _save_vpk(self) -> None:
-        if not isinstance(self.cachefile, VpkArchive):
+    def _save_archive(self) -> None:
+        if not hasattr(self.cachefile, "save"):
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save VPK", self.current_path or "", "VPK Files (*.vpk)")
+        if isinstance(self.cachefile, VpkArchive):
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save VPK", self.current_path or "", "VPK Files (*.vpk)"
+            )
+        else:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save GCF", self.current_path or "", "GCF Files (*.gcf)"
+            )
         if not path:
             return
         self.cachefile.save(path)
 
     # ------------------------------------------------------------------
     def _add_dropped_files(self, urls) -> None:
-        if not isinstance(self.cachefile, VpkArchive):
+        if not hasattr(self.cachefile, "add_file"):
             return
         folder = self._current_directory()
         if folder is None:
@@ -1669,6 +1908,14 @@ class GCFScapeWindow(QMainWindow):
             path = url.toLocalFile()
             if os.path.isfile(path):
                 self.cachefile.add_file(path, folder.path())
+            elif os.path.isdir(path):
+                base = os.path.basename(path)
+                self.cachefile.add_folder(folder.path(), base)
+                for root, _dirs, files in os.walk(path):
+                    rel = os.path.relpath(root, path)
+                    dest = self.cachefile._join_path(folder.path(), base, rel if rel != "." else "")
+                    for fn in files:
+                        self.cachefile.add_file(os.path.join(root, fn), dest)
         self._populate_tree()
 
     # ------------------------------------------------------------------

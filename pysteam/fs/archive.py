@@ -74,17 +74,73 @@ class ArchivePackage:
             child = folder.items.get(part)
             if not child:
                 child = DirectoryFolder(folder, part, self)
+                child.flags = 0
                 folder.items[part] = child
             folder = child
         name = parts[-1]
         file_entry = DirectoryFile(folder, name, self)
         file_entry.item_size = size
         file_entry._loader = loader
+        file_entry.flags = 0
         folder.items[name] = file_entry
 
     # ------------------------------------------------------------------
     def _size(self, entry):
         return getattr(entry, "item_size", 0)
+
+    # ------------------------------------------------------------------
+    def add_file(self, src_path: str, dest_dir: str = "") -> None:
+        name = os.path.basename(src_path)
+        dest_path = self._join_path(dest_dir, name)
+        self._add_file(dest_path, os.path.getsize(src_path), ("fs", src_path))
+
+    def add_folder(self, dest_dir: str, name: str) -> None:
+        path = self._join_path(dest_dir, name)
+        parts = [p for p in path.split("/") if p]
+        folder = self.root
+        for part in parts:
+            child = folder.items.get(part)
+            if not child:
+                child = DirectoryFolder(folder, part, self)
+                child.flags = 0
+                folder.items[part] = child
+            folder = child
+
+    def remove_file(self, path: str) -> None:
+        parts = [p for p in path.split("/") if p]
+        folder = self.root
+        for part in parts[:-1]:
+            folder = folder.items.get(part)
+            if folder is None:
+                return
+        folder.items.pop(parts[-1], None)
+
+    def move_file(self, old_path: str, new_path: str) -> None:
+        parts = [p for p in old_path.split("/") if p]
+        folder = self.root
+        for part in parts[:-1]:
+            folder = folder.items.get(part)
+            if folder is None:
+                return
+        entry = folder.items.pop(parts[-1], None)
+        if not entry:
+            return
+        dest_parts = [p for p in new_path.split("/") if p]
+        dest_folder = self.root
+        for part in dest_parts[:-1]:
+            child = dest_folder.items.get(part)
+            if not child:
+                child = DirectoryFolder(dest_folder, part, self)
+                child.flags = 0
+                dest_folder.items[part] = child
+            dest_folder = child
+        name = dest_parts[-1]
+        entry.name = name
+        if isinstance(entry, DirectoryFolder):
+            entry.owner = dest_folder
+        else:
+            entry.folder = dest_folder
+        dest_folder.items[name] = entry
 
 
 class PakFile(ArchivePackage):
@@ -234,6 +290,9 @@ class RarArchive(ArchivePackage):
 
 class VpkArchive(ArchivePackage):
     """Valve VPK package using :mod:`vpk`."""
+    def __init__(self) -> None:
+        super().__init__()
+        self.vpk = None
 
     def _parse(self) -> None:
         self.vpk = vpk.VPK(self._path, read_header_only=False)
@@ -242,39 +301,11 @@ class VpkArchive(ArchivePackage):
             self._add_file(path.replace("\\", "/"), file.length, path)
 
     def _open_file(self, entry, mode="rb", key=None):
-        vfile = self.vpk.get_file(entry._loader)
-        return io.BytesIO(vfile.read())
-
-    # ------------------------------------------------------------------
-    # Editing helpers
-    # ------------------------------------------------------------------
-    def add_file(self, src_path: str, dest_dir: str = "") -> None:
-        name = os.path.basename(src_path)
-        dest_path = self._join_path(dest_dir, name)
-        self._add_file(dest_path, os.path.getsize(src_path), ("fs", src_path))
-
-    def remove_file(self, path: str) -> None:
-        parts = [p for p in path.split("/") if p]
-        folder = self.root
-        for part in parts[:-1]:
-            folder = folder.items.get(part)
-            if folder is None:
-                return
-        folder.items.pop(parts[-1], None)
-
-    def move_file(self, old_path: str, new_path: str) -> None:
-        parts = [p for p in old_path.split("/") if p]
-        folder = self.root
-        for part in parts[:-1]:
-            folder = folder.items.get(part)
-            if folder is None:
-                return
-        entry = folder.items.pop(parts[-1], None)
-        if not entry:
-            return
         loader = getattr(entry, "_loader", None)
-        size = getattr(entry, "item_size", 0)
-        self._add_file(new_path, size, loader)
+        if isinstance(loader, tuple) and loader[0] == "fs":
+            return open(loader[1], mode)
+        vfile = self.vpk.get_file(loader)
+        return io.BytesIO(vfile.read())
 
     def save(self, output_path: str | None = None) -> None:
         if output_path is None:
