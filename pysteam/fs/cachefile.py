@@ -239,6 +239,192 @@ class CacheFile:
             finally:
                 self.stream = None
 
+    @classmethod
+    def build(cls, files: dict[str, bytes], app_id: int = 0, app_version: int = 0) -> "CacheFile":
+        """Construct a new :class:`CacheFile` from a mapping of paths to data.
+
+        The returned cache file lives in memory using the latest GCF format
+        (version 6).  Call :meth:`convert_version` to serialise it to disk in
+        any supported revision.
+        """
+
+        self = cls()
+        sector_size = CACHE_CHECKSUM_LENGTH
+        self.stream = BytesIO()
+        self._stream_owner = True
+        self.is_parsed = True
+
+        # ------------------------------------------------------------------
+        # Header setup
+        # ------------------------------------------------------------------
+        header = CacheFileHeader(self)
+        header.header_version = 1
+        header.cache_type = 1  # GCF
+        header.format_version = 6
+        header.application_id = app_id
+        header.application_version = app_version
+        header.is_mounted = 0
+        header.dummy1 = 0
+        header.file_size = 0
+        header.sector_size = sector_size
+        header.sector_count = 0
+        header.checksum = 0
+        self.header = header
+
+        # ------------------------------------------------------------------
+        # Manifest construction
+        # ------------------------------------------------------------------
+        manifest = CacheFileManifest(self)
+        manifest.header_version = 3
+        manifest.application_id = app_id
+        manifest.application_version = app_version
+        manifest.compression_block_size = sector_size
+        manifest.depot_info = 2
+        manifest.fingerprint = 0
+        manifest.manifest_entries = []
+        manifest.hash_table_keys = []
+        manifest.hash_table_indices = []
+        manifest.minimum_footprint_entries = []
+        manifest.user_config_entries = []
+        manifest.manifest_map_entries = []
+        manifest.map_header_version = 1
+        manifest.map_dummy1 = 0
+        filename_table = bytearray(b"\0")
+
+        # Build simple directory tree from mapping.
+        root: dict[str, object] = {}
+        for path, data in files.items():
+            parts = [p for p in path.replace("\\", "/").split("/") if p]
+            node: dict[str, object] = root
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})  # type: ignore[assignment]
+            node[parts[-1]] = data
+
+        file_nodes: list[tuple[int, bytes]] = []
+        checksums: list[int] = []
+
+        def add_entry(obj: object, name: str, parent: int) -> int:
+            index = len(manifest.manifest_entries)
+            entry = CacheFileManifestEntry(manifest)
+            entry.index = index
+            entry.name_offset = len(filename_table)
+            filename_table.extend(name.encode("utf-8") + b"\0")
+            entry.parent_index = parent
+            entry.next_index = 0
+            entry.child_index = 0
+            if isinstance(obj, dict):
+                # Directory
+                entry.item_size = 0
+                entry.checksum_index = 0
+                entry.directory_flags = 0
+                manifest.manifest_entries.append(entry)
+                manifest.manifest_map_entries.append(0xFFFFFFFF)
+                children: list[int] = []
+                for child_name in sorted(obj):
+                    children.append(add_entry(obj[child_name], child_name, index))
+                if children:
+                    entry.child_index = children[0]
+                    for a, b in zip(children, children[1:]):
+                        manifest.manifest_entries[a].next_index = b
+            else:
+                # File
+                data = obj  # type: ignore[assignment]
+                entry.item_size = len(data)
+                entry.checksum_index = len(checksums)
+                entry.directory_flags = CacheFileManifestEntry.FLAG_IS_FILE
+                manifest.manifest_entries.append(entry)
+                manifest.manifest_map_entries.append(0)
+                file_nodes.append((index, data))
+                checksums.append(zlib.crc32(data) & 0xFFFFFFFF)
+            return index
+
+        add_entry(root, "", 0xFFFFFFFF)
+
+        manifest.filename_table = bytes(filename_table)
+        manifest.node_count = len(manifest.manifest_entries)
+        manifest.file_count = len(file_nodes)
+        manifest.hash_table_indices = list(range(manifest.node_count))
+        manifest.owner = self
+        self.manifest = manifest
+
+        # ------------------------------------------------------------------
+        # Checksum map
+        # ------------------------------------------------------------------
+        if checksums:
+            checksum_map = CacheFileChecksumMap(self)
+            checksum_map.header_version = 1
+            checksum_map.checksum_size = 4
+            checksum_map.format_code = 1
+            checksum_map.version = 1
+            checksum_map.entries = [(1, i) for i in range(len(checksums))]
+            checksum_map.checksums = checksums
+            checksum_map.file_id_count = len(checksums)
+            checksum_map.checksum_count = len(checksums)
+            checksum_map.signature = b"\0" * 128
+            self.checksum_map = checksum_map
+        else:
+            self.checksum_map = None
+
+        # ------------------------------------------------------------------
+        # Block/Allocation tables and raw data
+        # ------------------------------------------------------------------
+        blocks = CacheFileBlockAllocationTable(self)
+        alloc = CacheFileAllocationTable(self)
+        alloc.entries = []
+        alloc.is_long_terminator = 1
+        alloc.terminator = 0xFFFFFFFF
+
+        total_blocks = 0
+        for file_index, data in file_nodes:
+            prev_block = None
+            for chunk_start in range(0, len(data), sector_size):
+                chunk = data[chunk_start:chunk_start + sector_size]
+                block = CacheFileBlockAllocationTableEntry(blocks)
+                block.index = total_blocks
+                block.entry_flags = CacheFileBlockAllocationTableEntry.FLAG_DATA
+                block.file_data_offset = total_blocks * sector_size
+                block.file_data_size = len(chunk)
+                block._first_sector_index = total_blocks
+                block._next_block_index = 0xFFFFFFFF
+                block._prev_block_index = (
+                    prev_block if prev_block is not None else 0xFFFFFFFF
+                )
+                block.manifest_index = file_index
+                if prev_block is not None:
+                    blocks.blocks[prev_block]._next_block_index = block.index
+                blocks.blocks.append(block)
+                alloc.entries.append(0xFFFFFFFF)
+                self.stream.write(chunk.ljust(sector_size, b"\0"))
+                if prev_block is None:
+                    manifest.manifest_map_entries[file_index] = block.index
+                prev_block = block.index
+                total_blocks += 1
+
+        blocks.block_count = total_blocks
+        blocks.blocks_used = total_blocks
+        blocks.last_block_used = total_blocks - 1 if total_blocks else 0
+        blocks.dummy1 = blocks.dummy2 = blocks.dummy3 = blocks.dummy4 = 0
+        self.blocks = blocks
+
+        alloc.sector_count = total_blocks
+        alloc.first_unused_entry = total_blocks
+        self.alloc_table = alloc
+
+        data_header = CacheFileSectorHeader(self)
+        data_header.format_version = 6
+        data_header.application_version = app_version
+        data_header.sector_count = total_blocks
+        data_header.sector_size = sector_size
+        data_header.first_sector_offset = 0
+        data_header.sectors_used = total_blocks
+        self.data_header = data_header
+
+        header.sector_count = total_blocks
+
+        self.stream.seek(0)
+        self._read_directory()
+        return self
+
     def convert_version(
         self,
         target_version: int,
@@ -291,6 +477,7 @@ class CacheFile:
             checksum_map.owner = owner
 
         header.format_version = target_version
+        data_header.format_version = target_version
         blocks.owner = owner
         alloc_table.owner = owner
 
@@ -305,9 +492,13 @@ class CacheFile:
             manifest.manifest_map_entries = [inverse.get(i, i) for i in original_map_entries]
         else:
             if block_entry_map is not None:
-                manifest.manifest_map_entries = [
-                    block_entry_map.entries[i] for i in original_map_entries
-                ]
+                mapped: list[int] = []
+                for i in original_map_entries:
+                    if i == 0xFFFFFFFF or i >= len(block_entry_map.entries):
+                        mapped.append(0xFFFFFFFF)
+                    else:
+                        mapped.append(block_entry_map.entries[i])
+                manifest.manifest_map_entries = mapped
             block_entry_map = None
             owner.block_entry_map = None
 
@@ -401,6 +592,11 @@ class CacheFile:
             + len(manifest_bytes)
             + len(checksum_bytes)
         )
+        data_header_bytes = data_header.serialize()
+        # The offset stored in the data header points to the first data sector,
+        # not the start of the header itself.  Account for the header size and
+        # re-serialise so both fields are in agreement.
+        data_header.first_sector_offset += len(data_header_bytes)
         data_header_bytes = data_header.serialize()
 
         total_data = data_header.sectors_used * data_header.sector_size
