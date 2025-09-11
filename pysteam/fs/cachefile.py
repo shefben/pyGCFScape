@@ -1685,27 +1685,25 @@ class CacheFileManifest:
         self.num_of_user_config_files = len(self.user_config_entries)
         self.num_of_minimum_footprint_files = len(self.minimum_footprint_entries)
         self.name_size = len(self.filename_table)
-        self.binary_size = 56 + 32 * self.node_count + self.name_size + 4 * (
-            self.hash_table_key_count
-            + self.num_of_user_config_files
-            + self.num_of_minimum_footprint_files
-        )
 
-        manifest_data_parts = []
+        body_parts = []
         for i in self.manifest_entries:
-            manifest_data_parts.append(i.serialize())
+            body_parts.append(i.serialize())
 
-        manifest_data_parts.append(self.filename_table)
-        manifest_data_parts.append(pack_dword_list(self.hash_table_keys))
-        manifest_data_parts.append(pack_dword_list(self.hash_table_indices))
-        manifest_data_parts.append(pack_dword_list(self.minimum_footprint_entries))
-        manifest_data_parts.append(pack_dword_list(self.user_config_entries))
+        body_parts.append(self.filename_table)
+        body_parts.append(pack_dword_list(self.hash_table_keys))
+        body_parts.append(pack_dword_list(self.hash_table_indices))
+        body_parts.append(pack_dword_list(self.minimum_footprint_entries))
+        body_parts.append(pack_dword_list(self.user_config_entries))
+        manifest_body = b"".join(body_parts)
+
+        extra_parts = []
         if self.owner.header.format_version > 1:
-            manifest_data_parts.append(
-                struct.pack("<2L", self.map_header_version, self.map_dummy1)
-            )
-        manifest_data_parts.append(pack_dword_list(self.manifest_map_entries))
-        manifest_data = b"".join(manifest_data_parts)
+            extra_parts.append(struct.pack("<2L", self.map_header_version, self.map_dummy1))
+        extra_parts.append(pack_dword_list(self.manifest_map_entries))
+        extra_data = b"".join(extra_parts)
+
+        self.binary_size = 56 + len(manifest_body)
 
         header_without_checksum = struct.pack(
             "<13L",
@@ -1725,8 +1723,16 @@ class CacheFileManifest:
         )
         self.header_data = header_without_checksum
 
-        self.checksum = adler32(header_without_checksum + b"\0\0\0\0" + manifest_data, 0) & 0xFFFFFFFF
-        return header_without_checksum + struct.pack("<L", self.checksum) + manifest_data
+        checksum_header = header_without_checksum[:-4] + b"\0\0\0\0"
+        self.checksum = (
+            adler32(checksum_header + b"\0\0\0\0" + manifest_body, 0) & 0xFFFFFFFF
+        )
+        return (
+            header_without_checksum
+            + struct.pack("<L", self.checksum)
+            + manifest_body
+            + extra_data
+        )
 
     def validate(self):
         if self.owner.header.application_id != self.application_id:
@@ -1748,7 +1754,10 @@ class CacheFileManifest:
     def calculate_checksum(self):
         # Blank out checksum and fingerprint + hack to get unsigned value.
         data = self.serialize()
-        return adler32(data[:48] + b"\0\0\0\0\0\0\0\0" + data[56:], 0) & 0xffffffff
+        body_end = self.binary_size
+        return adler32(
+            data[:48] + b"\0\0\0\0\0\0\0\0" + data[56:body_end], 0
+        ) & 0xFFFFFFFF
 
 class CacheFileManifestEntry:
 
