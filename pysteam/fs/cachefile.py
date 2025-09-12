@@ -77,6 +77,48 @@ def decrypt_gcf_data(data: bytes, key: bytes) -> bytes:
     return bytes(out)
 
 
+def _bobhash(k: bytes, initval: int = 1) -> int:
+    """Jenkins hash used for manifest name lookups."""
+
+    def sub(a: int, b: int) -> int:
+        return (a - b) & 0xFFFFFFFF
+
+    def xor(a: int, b: int) -> int:
+        return (a ^ b) & 0xFFFFFFFF
+
+    def mix(a: int, b: int, c: int) -> tuple[int, int, int]:
+        a = sub(a, b); a = sub(a, c); a = xor(a, c >> 13)
+        b = sub(b, c); b = sub(b, a); b = xor(b, a << 8)
+        c = sub(c, a); c = sub(c, b); c = xor(c, b >> 13)
+        a = sub(a, b); a = sub(a, c); a = xor(a, c >> 12)
+        b = sub(b, c); b = sub(b, a); b = xor(b, a << 16)
+        c = sub(c, a); c = sub(c, b); c = xor(c, b >> 5)
+        a = sub(a, b); a = sub(a, c); a = xor(a, c >> 3)
+        b = sub(b, c); b = sub(b, a); b = xor(b, a << 10)
+        c = sub(c, a); c = sub(c, b); c = xor(c, b >> 15)
+        return a, b, c
+
+    a = 0x9E3779B9
+    b = 0x9E3779B9
+    c = initval & 0xFFFFFFFF
+    origlen = len(k)
+
+    while len(k) >= 12:
+        a = (a + struct.unpack('<I', k[0:4])[0]) & 0xFFFFFFFF
+        b = (b + struct.unpack('<I', k[4:8])[0]) & 0xFFFFFFFF
+        c = (c + struct.unpack('<I', k[8:12])[0]) & 0xFFFFFFFF
+        a, b, c = mix(a, b, c)
+        k = k[12:]
+
+    c = (c + origlen) & 0xFFFFFFFF
+    k = k.ljust(11, b'\x00')
+    a = (a + struct.unpack('<I', k[0:4])[0]) & 0xFFFFFFFF
+    b = (b + struct.unpack('<I', k[4:8])[0]) & 0xFFFFFFFF
+    c = (c + struct.unpack('<I', b'\x00' + k[8:11])[0]) & 0xFFFFFFFF
+    a, b, c = mix(a, b, c)
+    return c & 0xFFFFFFFF
+
+
 def unpack_dword_list(stream, count):
     """Return ``count`` little-endian DWORDs from ``stream`` as a list.
 
@@ -323,7 +365,7 @@ class CacheFile:
             if isinstance(obj, dict):
                 # Directory
                 entry.item_size = 0
-                entry.checksum_index = 0
+                entry.checksum_index = 0xFFFFFFFF
                 entry.directory_flags = flags.get(path, 0)
                 manifest.manifest_entries.append(entry)
                 manifest.manifest_map_entries.append(0xFFFFFFFF)
@@ -331,6 +373,7 @@ class CacheFile:
                 for child_name in sorted(obj):
                     child_path = path + "/" + child_name if path else child_name
                     children.append(add_entry(obj[child_name], child_name, index, child_path))
+                entry.item_size = len(children)
                 if children:
                     entry.child_index = children[0]
                     for a, b in zip(children, children[1:]):
@@ -352,7 +395,29 @@ class CacheFile:
         manifest.filename_table = bytes(filename_table)
         manifest.node_count = len(manifest.manifest_entries)
         manifest.file_count = len(file_nodes)
-        manifest.hash_table_indices = list(range(manifest.node_count))
+
+        # Build manifest hash table used for name lookups
+        bucket_count = 1 << ((manifest.node_count * 2 - 1).bit_length())
+        buckets: list[list[int]] = [[] for _ in range(bucket_count)]
+        for entry in manifest.manifest_entries:
+            off = entry.name_offset
+            end = manifest.filename_table.index(b"\0", off)
+            name = manifest.filename_table[off:end].lower()
+            h = _bobhash(name)
+            buckets[h & (bucket_count - 1)].append(entry.index)
+
+        hash_table_keys = [0xFFFFFFFF] * bucket_count
+        hash_table_indices: list[int] = []
+        for i, bucket in enumerate(buckets):
+            if not bucket:
+                continue
+            hash_table_keys[i] = bucket_count + len(hash_table_indices)
+            for j, idx in enumerate(bucket):
+                val = idx | (0x80000000 if j == len(bucket) - 1 else 0)
+                hash_table_indices.append(val)
+
+        manifest.hash_table_keys = hash_table_keys
+        manifest.hash_table_indices = hash_table_indices
         manifest.owner = self
         self.manifest = manifest
 
@@ -1685,27 +1750,25 @@ class CacheFileManifest:
         self.num_of_user_config_files = len(self.user_config_entries)
         self.num_of_minimum_footprint_files = len(self.minimum_footprint_entries)
         self.name_size = len(self.filename_table)
-        self.binary_size = 56 + 32 * self.node_count + self.name_size + 4 * (
-            self.hash_table_key_count
-            + self.num_of_user_config_files
-            + self.num_of_minimum_footprint_files
-        )
 
-        manifest_data_parts = []
+        body_parts = []
         for i in self.manifest_entries:
-            manifest_data_parts.append(i.serialize())
+            body_parts.append(i.serialize())
 
-        manifest_data_parts.append(self.filename_table)
-        manifest_data_parts.append(pack_dword_list(self.hash_table_keys))
-        manifest_data_parts.append(pack_dword_list(self.hash_table_indices))
-        manifest_data_parts.append(pack_dword_list(self.minimum_footprint_entries))
-        manifest_data_parts.append(pack_dword_list(self.user_config_entries))
+        body_parts.append(self.filename_table)
+        body_parts.append(pack_dword_list(self.hash_table_keys))
+        body_parts.append(pack_dword_list(self.hash_table_indices))
+        body_parts.append(pack_dword_list(self.minimum_footprint_entries))
+        body_parts.append(pack_dword_list(self.user_config_entries))
+        manifest_body = b"".join(body_parts)
+
+        extra_parts = []
         if self.owner.header.format_version > 1:
-            manifest_data_parts.append(
-                struct.pack("<2L", self.map_header_version, self.map_dummy1)
-            )
-        manifest_data_parts.append(pack_dword_list(self.manifest_map_entries))
-        manifest_data = b"".join(manifest_data_parts)
+            extra_parts.append(struct.pack("<2L", self.map_header_version, self.map_dummy1))
+        extra_parts.append(pack_dword_list(self.manifest_map_entries))
+        extra_data = b"".join(extra_parts)
+
+        self.binary_size = 56 + len(manifest_body)
 
         header_without_checksum = struct.pack(
             "<13L",
@@ -1725,8 +1788,16 @@ class CacheFileManifest:
         )
         self.header_data = header_without_checksum
 
-        self.checksum = adler32(header_without_checksum + b"\0\0\0\0" + manifest_data, 0) & 0xFFFFFFFF
-        return header_without_checksum + struct.pack("<L", self.checksum) + manifest_data
+        checksum_header = header_without_checksum[:-4] + b"\0\0\0\0"
+        self.checksum = (
+            adler32(checksum_header + b"\0\0\0\0" + manifest_body, 0) & 0xFFFFFFFF
+        )
+        return (
+            header_without_checksum
+            + struct.pack("<L", self.checksum)
+            + manifest_body
+            + extra_data
+        )
 
     def validate(self):
         if self.owner.header.application_id != self.application_id:
@@ -1748,7 +1819,10 @@ class CacheFileManifest:
     def calculate_checksum(self):
         # Blank out checksum and fingerprint + hack to get unsigned value.
         data = self.serialize()
-        return adler32(data[:48] + b"\0\0\0\0\0\0\0\0" + data[56:], 0) & 0xffffffff
+        body_end = self.binary_size
+        return adler32(
+            data[:48] + b"\0\0\0\0\0\0\0\0" + data[56:body_end], 0
+        ) & 0xFFFFFFFF
 
 class CacheFileManifestEntry:
 
