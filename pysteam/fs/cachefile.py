@@ -427,14 +427,21 @@ class CacheFile:
         if checksums:
             checksum_map = CacheFileChecksumMap(self)
             checksum_map.header_version = 1
-            checksum_map.checksum_size = 4
-            checksum_map.format_code = 1
+            checksum_map.checksum_size = 0  # placeholder, recomputed below
+            # External validators expect a magic value in the "format" field.
+            checksum_map.format_code = 0x14893721
             checksum_map.version = 1
             checksum_map.entries = [(1, i) for i in range(len(checksums))]
             checksum_map.checksums = checksums
             checksum_map.file_id_count = len(checksums)
             checksum_map.checksum_count = len(checksums)
             checksum_map.signature = b"\0" * 128
+            checksum_map.checksum_size = (
+                16
+                + checksum_map.file_id_count * 8
+                + checksum_map.checksum_count * 4
+                + 128
+            )
             self.checksum_map = checksum_map
         else:
             self.checksum_map = None
@@ -585,8 +592,7 @@ class CacheFile:
             manifest.application_id = header.application_id
             manifest.application_version = header.application_version
             manifest.compression_block_size = header.sector_size
-            manifest.hash_table_keys = []
-            manifest.hash_table_indices = [0] * manifest.node_count
+            # Retain the hash table so external validators can resolve names.
             manifest.minimum_footprint_entries = []
             manifest.user_config_entries = []
             manifest.depot_info = 0
@@ -597,8 +603,8 @@ class CacheFile:
             if checksum_map is None:
                 checksum_map = CacheFileChecksumMap(owner)
                 checksum_map.header_version = 1
-                checksum_map.checksum_size = 4
-                checksum_map.format_code = 1
+                checksum_map.checksum_size = 0  # placeholder, recomputed below
+                checksum_map.format_code = 0x14893721
                 checksum_map.version = 1
                 checksum_map.entries = []
                 checksum_map.checksums = []
@@ -629,8 +635,16 @@ class CacheFile:
                         block = block.next_block
                     checksum_map.entries.append((1, len(checksum_map.checksums)))
                     checksum_map.checksums.append(crc & 0xFFFFFFFF)
-                checksum_map.file_id_count = len(checksum_map.entries)
-                checksum_map.checksum_count = len(checksum_map.checksums)
+            else:
+                checksum_map.format_code = 0x14893721
+            checksum_map.file_id_count = len(checksum_map.entries)
+            checksum_map.checksum_count = len(checksum_map.checksums)
+            checksum_map.checksum_size = (
+                16
+                + checksum_map.file_id_count * 8
+                + checksum_map.checksum_count * 4
+                + 128
+            )
             checksum_map.owner = owner
         else:
             checksum_map = None
