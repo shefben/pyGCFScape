@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import subprocess
 from pathlib import Path
 
 from pysteam.fs.cachefile import CacheFile

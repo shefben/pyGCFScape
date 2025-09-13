@@ -14,8 +14,14 @@ def test_manifest_hashtable(tmp_path):
     cf.convert_version(6, out_v6)
     rebuilt_v6 = CacheFile.parse(out_v6)
     Manifest(BytesIO(rebuilt_v6.manifest.serialize()), adjust_size=True)
+    assert len(rebuilt_v6.manifest.hash_table_keys) & (
+        len(rebuilt_v6.manifest.hash_table_keys) - 1
+    ) == 0
 
     out_v1 = tmp_path / "test_v1.gcf"
     cf.convert_version(1, out_v1)
     rebuilt_v1 = CacheFile.parse(out_v1)
     Manifest(BytesIO(rebuilt_v1.manifest.serialize()), adjust_size=True)
+    assert len(rebuilt_v1.manifest.hash_table_keys) & (
+        len(rebuilt_v1.manifest.hash_table_keys) - 1
+    ) == 0

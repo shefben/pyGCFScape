@@ -72,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
         cm = cf.checksum_map
         print(f"  file_entries: {cm.file_id_count}")
         print(f"  checksum_count: {cm.checksum_count}")
+        ok = cm.verify_signature()
+        print(f"  signature: {'ok' if ok else 'mismatch'}")
     if errors:
         print("  mismatched files:")
         for p in errors:
