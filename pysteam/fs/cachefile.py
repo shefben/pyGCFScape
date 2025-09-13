@@ -2064,8 +2064,37 @@ class CacheFileChecksumMap:
         return _rsa_pkcs1_sha1_verify(self._payload(), self.signature)
 
     def validate(self):
-        pass
-        # NOTE: This check is incorrect on the test file (half-life 2 game dialog.gcf) I have.
+        if self.header_version != 1:
+            raise ValueError(
+                "Invalid Cache File Checksum Map [HeaderVersion is not 1]"
+            )
+        if self.format_code != 0x14893721:
+            raise ValueError(
+                "Invalid Cache File Checksum Map [FormatCode mismatch]"
+            )
+        if self.version != 1:
+            raise ValueError(
+                "Invalid Cache File Checksum Map [Dummy0 is not 1]"
+            )
+        if self.file_id_count != len(self.entries):
+            raise ValueError(
+                "Invalid Cache File Checksum Map [FileIdCount mismatch]"
+            )
+        if self.checksum_count != len(self.checksums):
+            raise ValueError(
+                "Invalid Cache File Checksum Map [ChecksumCount mismatch]"
+            )
+        if (
+            self.latest_application_version
+            != self.owner.header.application_version
+        ):
+            raise ValueError(
+                "Invalid Cache File Checksum Map [ApplicationVersion mismatch]"
+            )
+        if not self.verify_signature():
+            raise ValueError(
+                "Invalid Cache File Checksum Map [Signature mismatch]"
+            )
         # if self.owner.directory.file_count != self.item_count:
         #     raise ValueError, "Invalid Cache File Checksum Map [ItemCount and FileCount don't match]"
 
