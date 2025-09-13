@@ -273,9 +273,12 @@ class CacheFile:
             self.alloc_table.parse(stream)
             self.alloc_table.validate()
 
-            # Block entry map mapping directory entries to block entries
-            self.block_entry_map = CacheFileBlockEntryMap(self)
-            self.block_entry_map.parse(stream)
+            # Block entry map mapping directory entries to block entries.
+            if self.header.format_version < 6:
+                self.block_entry_map = CacheFileBlockEntryMap(self)
+                self.block_entry_map.parse(stream)
+            else:
+                self.block_entry_map = None
 
         # Manifest
         self.manifest = CacheFileManifest(self)
@@ -644,12 +647,19 @@ class CacheFile:
 
         original_map_entries = list(manifest.manifest_map_entries)
 
-        if block_entry_map is None:
-            block_entry_map = CacheFileBlockEntryMap(owner)
-            block_entry_map.entries = list(range(blocks.block_count))
+        if target_version < 6:
+            if block_entry_map is None:
+                block_entry_map = CacheFileBlockEntryMap(owner)
+                block_entry_map.entries = list(range(blocks.block_count))
             owner.block_entry_map = block_entry_map
-        inverse = {blk: idx for idx, blk in enumerate(block_entry_map.entries)}
-        manifest.manifest_map_entries = [inverse.get(i, i) for i in original_map_entries]
+            inverse = {blk: idx for idx, blk in enumerate(block_entry_map.entries)}
+            manifest.manifest_map_entries = [
+                inverse.get(i, i) for i in original_map_entries
+            ]
+        else:
+            block_entry_map = None
+            owner.block_entry_map = None
+            manifest.manifest_map_entries = original_map_entries
 
         for i, idx in enumerate(manifest.manifest_map_entries):
             if idx == 0xFFFFFFFF:
@@ -1758,6 +1768,21 @@ class CacheFileBlockEntryMap:
 
         self.entries = ordered
 
+    def calculate_checksum(self) -> int:
+        return (
+            self.block_count
+            + self.first_block_entry_index
+            + self.last_block_entry_index
+            + self.dummy0
+        ) & 0xFFFFFFFF
+
+    def validate(self):
+        if self.owner.header.format_version > 1:
+            if self.checksum != self.calculate_checksum():
+                raise ValueError(
+                    "Invalid Block Entry Map [Checksums do not match]"
+                )
+
     def serialize(self):
         self.block_count = len(self.entries)
         self.first_block_entry_index = self.entries[0] if self.entries else 0
@@ -1778,7 +1803,7 @@ class CacheFileBlockEntryMap:
             self.last_block_entry_index,
             self.dummy0,
         )
-        self.checksum = sum(header)
+        self.checksum = self.calculate_checksum()
         data = [header, struct.pack("<L", self.checksum)]
         data.extend(struct.pack("<2L", *e) for e in raw_entries)
         return b"".join(data)
