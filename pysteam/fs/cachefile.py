@@ -641,9 +641,11 @@ class CacheFile:
             checksum_map.owner = owner
 
         header.format_version = target_version
+        header.dummy1 = 0
         data_header.format_version = target_version
         blocks.owner = owner
         alloc_table.owner = owner
+        blocks.dummy1 = blocks.dummy2 = blocks.dummy3 = blocks.dummy4 = 0
 
         original_map_entries = list(manifest.manifest_map_entries)
 
@@ -1527,14 +1529,16 @@ class CacheFileBlockAllocationTable:
     def parse(self, stream):
 
         # Blocks Header
-        (self.block_count,
-         self.blocks_used,
-         self.last_block_used,
-         self.dummy1,
-         self.dummy2,
-         self.dummy3,
-         self.dummy4) = struct.unpack("<7L", stream.read(28))
-        self.checksum = sum(stream.read(4))
+        (
+            self.block_count,
+            self.blocks_used,
+            self.last_block_used,
+            self.dummy1,
+            self.dummy2,
+            self.dummy3,
+            self.dummy4,
+        ) = struct.unpack("<7L", stream.read(28))
+        (self.checksum,) = struct.unpack("<L", stream.read(4))
 
         # Block Entries
         for i in range(self.block_count):
@@ -1544,19 +1548,45 @@ class CacheFileBlockAllocationTable:
             self.blocks.append(block)
 
     def serialize(self):
-        data = struct.pack("<7L", self.block_count, self.blocks_used, self.last_block_used, self.dummy1, self.dummy2, self.dummy3, self.dummy4)
-        self.checksum = sum(data)
-        return data + struct.pack("<L", self.checksum) + b"".join(x.serialize() for x in self.blocks)
+        self.block_count = len(self.blocks)
+        self.blocks_used = self.block_count
+        self.last_block_used = self.block_count - 1 if self.blocks else 0
+        header = struct.pack(
+            "<7L",
+            self.block_count,
+            self.blocks_used,
+            self.last_block_used,
+            self.dummy1,
+            self.dummy2,
+            self.dummy3,
+            self.dummy4,
+        )
+        self.checksum = self.calculate_checksum()
+        return header + struct.pack("<L", self.checksum) + b"".join(
+            x.serialize() for x in self.blocks
+        )
 
     def calculate_checksum(self):
-        return sum(self.serialize()[:24])
+        return (
+            self.block_count
+            + self.blocks_used
+            + self.last_block_used
+            + self.dummy1
+            + self.dummy2
+            + self.dummy3
+            + self.dummy4
+        ) & 0xFFFFFFFF
 
     def validate(self):
         if self.owner.header.sector_count != self.block_count:
-            raise ValueError("Invalid Cache Block [Sector/BlockCounts do not match]")
-        #print self.checksum, self.calculate_checksum()
-        #if self.checksum != self.calculate_checksum():
-        #    raise ValueError, "Invalid Cache Block [Checksums do not match]"
+            raise ValueError(
+                "Invalid Cache Block [Sector/BlockCounts do not match]"
+            )
+        if self.owner.header.format_version > 1:
+            if self.checksum != self.calculate_checksum():
+                raise ValueError(
+                    "Invalid Cache Block [Checksums do not match]"
+                )
 
 class CacheFileBlockAllocationTableEntry:
 
@@ -1571,19 +1601,49 @@ class CacheFileBlockAllocationTableEntry:
         self.owner = owner
 
     def parse(self, stream):
-        # Block Entry
-        (
-            self.entry_flags,
-            self.dummy0,
-            self.file_data_offset,
-            self.file_data_size,
-            self._first_sector_index,
-            self._next_block_index,
-            self._prev_block_index,
-            self.manifest_index,
-        ) = struct.unpack("<2H6L", stream.read(28))
-        # Maintain backwards compatibility with callers expecting ``flags``.
-        self.flags = (self.dummy0 << 16) | self.entry_flags
+        """Parse a block entry from ``stream``.
+
+        The layout of ``CacheFileBlockAllocationTableEntry`` changed between
+        legacy GCF revisions and the modern v6 format.  Older versions store a
+        single 32‑bit ``Flags`` field while newer archives split this value into
+        two 16‑bit fields (``EntryFlags`` and ``Dummy0``).  Attempting to unpack
+        a v1 entry using the v6 structure results in misaligned fields which in
+        turn can produce integers outside the valid range for ``struct.pack``
+        during conversion.  This manifested as ``struct.error: argument out of
+        range`` when converting certain v1 files to v6.
+
+        Detect the on-disk format via the owning header's ``format_version`` and
+        decode accordingly so subsequent serialisation uses the correct layout.
+        """
+
+        fmt = self.owner.owner.header.format_version
+        data = stream.read(28)
+        if fmt <= 1:
+            (
+                flags,
+                self.file_data_offset,
+                self.file_data_size,
+                self._first_sector_index,
+                self._next_block_index,
+                self._prev_block_index,
+                self.manifest_index,
+            ) = struct.unpack("<7L", data)
+            self.entry_flags = flags & 0xFFFF
+            self.dummy0 = (flags >> 16) & 0xFFFF
+            self.flags = flags
+        else:
+            (
+                self.entry_flags,
+                self.dummy0,
+                self.file_data_offset,
+                self.file_data_size,
+                self._first_sector_index,
+                self._next_block_index,
+                self._prev_block_index,
+                self.manifest_index,
+            ) = struct.unpack("<2H6L", data)
+            # Maintain backwards compatibility with callers expecting ``flags``.
+            self.flags = (self.dummy0 << 16) | self.entry_flags
 
     def _get_sector_iterator(self):
         sector = self.first_sector
@@ -1644,6 +1704,19 @@ class CacheFileBlockAllocationTableEntry:
     is_fragmented = property(_get_is_fragmented)
 
     def serialize(self):
+        fmt = self.owner.owner.header.format_version
+        if fmt <= 1:
+            flags = (self.dummy0 << 16) | self.entry_flags
+            return struct.pack(
+                "<7L",
+                flags,
+                self.file_data_offset,
+                self.file_data_size,
+                self._first_sector_index,
+                self._next_block_index,
+                self._prev_block_index,
+                self.manifest_index,
+            )
         return struct.pack(
             "<2H6L",
             self.entry_flags,
