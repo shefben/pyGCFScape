@@ -351,6 +351,7 @@ class CacheFile:
             node[parts[-1]] = data
 
         file_nodes: list[tuple[int, bytes]] = []
+        checksum_entries: list[tuple[int, int]] = []
         checksums: list[int] = []
 
         def add_entry(obj: object, name: str, parent: int, path: str) -> int:
@@ -382,12 +383,26 @@ class CacheFile:
                 # File
                 data = obj  # type: ignore[assignment]
                 entry.item_size = len(data)
-                entry.checksum_index = len(checksums)
-                entry.directory_flags = flags.get(path, 0) | CacheFileManifestEntry.FLAG_IS_FILE
+                entry.checksum_index = len(checksum_entries)
+                entry.directory_flags = (
+                    flags.get(path, 0) | CacheFileManifestEntry.FLAG_IS_FILE
+                )
                 manifest.manifest_entries.append(entry)
                 manifest.manifest_map_entries.append(0)
                 file_nodes.append((index, data))
-                checksums.append(zlib.crc32(data) & 0xFFFFFFFF)
+
+                start = len(checksums)
+                chunk_count = 0
+                for offset in range(0, len(data), CACHE_CHECKSUM_LENGTH):
+                    chunk = data[offset : offset + CACHE_CHECKSUM_LENGTH]
+                    chk = (zlib.crc32(chunk) ^ adler32(chunk)) & 0xFFFFFFFF
+                    checksums.append(chk)
+                    chunk_count += 1
+                if chunk_count == 0:
+                    chk = (zlib.crc32(b"") ^ adler32(b"")) & 0xFFFFFFFF
+                    checksums.append(chk)
+                    chunk_count = 1
+                checksum_entries.append((chunk_count, start))
             return index
 
         add_entry(root, "", 0xFFFFFFFF, "")
@@ -424,16 +439,16 @@ class CacheFile:
         # ------------------------------------------------------------------
         # Checksum map
         # ------------------------------------------------------------------
-        if checksums:
+        if checksum_entries:
             checksum_map = CacheFileChecksumMap(self)
             checksum_map.header_version = 1
             checksum_map.checksum_size = 0  # placeholder, recomputed below
             # External validators expect a magic value in the "format" field.
             checksum_map.format_code = 0x14893721
             checksum_map.version = 1
-            checksum_map.entries = [(1, i) for i in range(len(checksums))]
+            checksum_map.entries = checksum_entries
             checksum_map.checksums = checksums
-            checksum_map.file_id_count = len(checksums)
+            checksum_map.file_id_count = len(checksum_entries)
             checksum_map.checksum_count = len(checksums)
             checksum_map.signature = b"\0" * 128
             checksum_map.checksum_size = (
@@ -609,14 +624,17 @@ class CacheFile:
                 checksum_map.entries = []
                 checksum_map.checksums = []
                 checksum_map.signature = b"\0" * 128
-                for entry in self.manifest.manifest_entries:
+                for entry in manifest.manifest_entries:
                     if not (
                         entry.directory_flags & CacheFileManifestEntry.FLAG_IS_FILE
                     ):
                         continue
-                    crc = 0
+                    entry.checksum_index = len(checksum_map.entries)
+                    start = len(checksum_map.checksums)
+                    chunk_count = 0
                     remaining = entry.item_size
                     block = entry.first_block
+                    buffer = bytearray()
                     while block is not None and remaining > 0:
                         for sector in block.sectors:
                             if remaining <= 0:
@@ -628,13 +646,21 @@ class CacheFile:
                             chunk = self.stream.read(
                                 min(remaining, self.header.sector_size)
                             )
-                            crc = zlib.crc32(chunk, crc)
+                            buffer.extend(chunk)
                             remaining -= len(chunk)
+                            while len(buffer) >= CACHE_CHECKSUM_LENGTH:
+                                part = buffer[:CACHE_CHECKSUM_LENGTH]
+                                del buffer[:CACHE_CHECKSUM_LENGTH]
+                                chk = (zlib.crc32(part) ^ adler32(part)) & 0xFFFFFFFF
+                                checksum_map.checksums.append(chk)
+                                chunk_count += 1
                             if remaining <= 0:
                                 break
                         block = block.next_block
-                    checksum_map.entries.append((1, len(checksum_map.checksums)))
-                    checksum_map.checksums.append(crc & 0xFFFFFFFF)
+                    chk = (zlib.crc32(buffer) ^ adler32(buffer)) & 0xFFFFFFFF
+                    checksum_map.checksums.append(chk)
+                    chunk_count += 1
+                    checksum_map.entries.append((chunk_count, start))
             else:
                 checksum_map.format_code = 0x14893721
             checksum_map.file_id_count = len(checksum_map.entries)
