@@ -504,6 +504,7 @@ class CacheFile:
                 + checksum_map.file_id_count * 8
                 + checksum_map.checksum_count * 4
                 + 128
+                + 4
             )
             self.checksum_map = checksum_map
         else:
@@ -733,6 +734,7 @@ class CacheFile:
                 + checksum_map.file_id_count * 8
                 + checksum_map.checksum_count * 4
                 + 128
+                + 4
             )
             checksum_map.owner = owner
         else:

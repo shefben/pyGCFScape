@@ -24,6 +24,10 @@ def test_convert_v1_to_v6_has_required_tables(tmp_path):
     assert rebuilt.block_entry_map is not None
     assert rebuilt.checksum_map is not None
     assert rebuilt.alloc_table.is_long_terminator == 1
+    assert (
+        rebuilt.checksum_map.checksum_size
+        == len(rebuilt.checksum_map.serialize()) - 8
+    )
 
     # Validate structure using reference validator
     validator = (

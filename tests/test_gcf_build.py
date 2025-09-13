@@ -12,6 +12,10 @@ def test_build_round_trip(tmp_path):
     assert "hello.txt" in rebuilt.root.items
     assert rebuilt.header.sector_size == 0x2000
     assert rebuilt.manifest.compression_block_size == 0x8000
+    assert (
+        rebuilt.checksum_map.checksum_size
+        == len(rebuilt.checksum_map.serialize()) - 8
+    )
     assert out.stat().st_size == rebuilt.header.file_size
     f = rebuilt.root["hello.txt"].open("rb")
     try:
