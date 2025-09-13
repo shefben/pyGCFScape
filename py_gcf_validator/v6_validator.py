@@ -243,10 +243,10 @@ def validate_v6(cache: CacheFile) -> List[str]:
             actual = []
             for offset in range(0, len(data), CACHE_CHECKSUM_LENGTH):
                 chunk = data[offset:offset + CACHE_CHECKSUM_LENGTH]
-                chk = (zlib.crc32(chunk) ^ zlib.adler32(chunk)) & 0xFFFFFFFF
+                chk = (zlib.crc32(chunk) ^ zlib.adler32(chunk, 0)) & 0xFFFFFFFF
                 actual.append(chk)
             if not actual:
-                chk = (zlib.crc32(b"") ^ zlib.adler32(b"")) & 0xFFFFFFFF
+                chk = (zlib.crc32(b"") ^ zlib.adler32(b"", 0)) & 0xFFFFFFFF
                 actual.append(chk)
             if expected != actual:
                 errors.append(f"Checksum mismatch for {f.path()}")
