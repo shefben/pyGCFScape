@@ -28,5 +28,12 @@ def test_convert_v1_to_v6_has_required_tables(tmp_path):
         rebuilt.checksum_map.checksum_size
         == len(rebuilt.checksum_map.serialize()) - 8
     )
+    assert rebuilt.header.dummy1 == 0
+    assert rebuilt.blocks.dummy1 == 0
+    assert rebuilt.blocks.dummy2 == 0
+    assert rebuilt.blocks.dummy3 == 0
+    assert rebuilt.blocks.dummy4 == 0
+    assert rebuilt.blocks.checksum == rebuilt.blocks.calculate_checksum()
+    assert rebuilt.alloc_table.checksum == rebuilt.alloc_table.calculate_checksum()
 
     # Reference validator does not support the reduced v6 layout.
