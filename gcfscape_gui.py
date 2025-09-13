@@ -962,6 +962,12 @@ class GCFScapeWindow(QMainWindow):
         self.delete_action.triggered.connect(self._delete_selected)
         self.rename_action = QAction("Rename…", self)
         self.rename_action.triggered.connect(self._rename_selected)
+        self.minimum_footprint_action = QAction(
+            "Set Minimum Footprint", self, checkable=True
+        )
+        self.minimum_footprint_action.toggled.connect(
+            self._toggle_minimum_footprint
+        )
         flag_defs = [
             ("Executable", CacheFileManifestEntry.FLAG_IS_EXECUTABLE),
             ("Hidden", CacheFileManifestEntry.FLAG_IS_HIDDEN),
@@ -1041,6 +1047,7 @@ class GCFScapeWindow(QMainWindow):
         edit_menu.addAction(self.new_folder_action)
         edit_menu.addAction(self.rename_action)
         edit_menu.addAction(self.delete_action)
+        edit_menu.addAction(self.minimum_footprint_action)
         self.flags_menu = edit_menu.addMenu("Flags")
         for act in self.flag_actions.values():
             self.flags_menu.addAction(act)
@@ -1195,20 +1202,34 @@ class GCFScapeWindow(QMainWindow):
         if not hasattr(self.cachefile, "add_file"):
             self.rename_action.setEnabled(False)
             self.delete_action.setEnabled(False)
+            self.minimum_footprint_action.setEnabled(False)
             if hasattr(self, "flags_menu"):
                 self.flags_menu.setEnabled(False)
             return
         entries = self._selected_entries()
         self.rename_action.setEnabled(len(entries) == 1)
         self.delete_action.setEnabled(bool(entries))
+        self.minimum_footprint_action.setEnabled(bool(entries))
         if hasattr(self, "flags_menu"):
             self.flags_menu.setEnabled(bool(entries))
         if not entries:
+            self.minimum_footprint_action.blockSignals(True)
+            self.minimum_footprint_action.setChecked(False)
+            self.minimum_footprint_action.blockSignals(False)
             for act in self.flag_actions.values():
                 act.blockSignals(True)
                 act.setChecked(False)
                 act.blockSignals(False)
             return
+        has_minimum = False
+        for e in entries:
+            files = e.all_files() if e.is_folder() else [e]
+            if any(getattr(f, "is_minimum_footprint", False) for f in files):
+                has_minimum = True
+                break
+        self.minimum_footprint_action.blockSignals(True)
+        self.minimum_footprint_action.setChecked(has_minimum)
+        self.minimum_footprint_action.blockSignals(False)
         common = None
         for e in entries:
             common = (
@@ -1472,6 +1493,7 @@ class GCFScapeWindow(QMainWindow):
             self.new_folder_action,
             self.delete_action,
             self.rename_action,
+            self.minimum_footprint_action,
         ):
             act.setEnabled(enabled)
         self.save_action.setEnabled(enabled and hasattr(self.cachefile, "save"))
@@ -1936,6 +1958,59 @@ class GCFScapeWindow(QMainWindow):
         new_path = self.cachefile._join_path(entry.folder.path(), new_name)
         self.cachefile.move_file(entry.path(), new_path)
         self._populate_tree()
+
+    # ------------------------------------------------------------------
+    def _toggle_minimum_footprint(self, checked: bool) -> None:
+        if checked:
+            self._set_minimum_footprint()
+        else:
+            self._unset_minimum_footprint()
+
+    # ------------------------------------------------------------------
+    def _set_minimum_footprint(self, entries=None) -> None:
+        if not self.cachefile or not hasattr(self.cachefile, "manifest"):
+            return
+        if entries is None:
+            entries = self._selected_entries()
+        manifest = self.cachefile.manifest
+        for entry in entries:
+            files = entry.all_files() if entry.is_folder() else [entry]
+            for f in files:
+                idx = getattr(f, "index", None)
+                if idx is None:
+                    continue
+                if idx not in manifest.minimum_footprint_entries:
+                    manifest.minimum_footprint_entries.append(idx)
+                f.is_minimum_footprint = True
+                flags = getattr(f, "flags", 0) | CacheFileManifestEntry.FLAG_IS_PURGE_FILE
+                f.flags = flags
+                if hasattr(f, "_manifest_entry"):
+                    f._manifest_entry.directory_flags = flags
+        if entries:
+            self._populate_tree()
+
+    # ------------------------------------------------------------------
+    def _unset_minimum_footprint(self, entries=None) -> None:
+        if not self.cachefile or not hasattr(self.cachefile, "manifest"):
+            return
+        if entries is None:
+            entries = self._selected_entries()
+        manifest = self.cachefile.manifest
+        for entry in entries:
+            files = entry.all_files() if entry.is_folder() else [entry]
+            for f in files:
+                idx = getattr(f, "index", None)
+                if idx is None:
+                    continue
+                if idx in manifest.minimum_footprint_entries:
+                    manifest.minimum_footprint_entries.remove(idx)
+                f.is_minimum_footprint = False
+                flags = getattr(f, "flags", 0) & ~CacheFileManifestEntry.FLAG_IS_PURGE_FILE
+                f.flags = flags
+                if hasattr(f, "_manifest_entry"):
+                    f._manifest_entry.directory_flags = flags
+        if entries:
+            self._populate_tree()
 
     # ------------------------------------------------------------------
     def _save_archive(self) -> None:

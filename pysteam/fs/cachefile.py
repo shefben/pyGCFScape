@@ -446,11 +446,11 @@ class CacheFile:
                 chunk_count = 0
                 for offset in range(0, len(data), CACHE_CHECKSUM_LENGTH):
                     chunk = data[offset : offset + CACHE_CHECKSUM_LENGTH]
-                    chk = (zlib.crc32(chunk) ^ adler32(chunk)) & 0xFFFFFFFF
+                    chk = (zlib.crc32(chunk) ^ adler32(chunk, 0)) & 0xFFFFFFFF
                     checksums.append(chk)
                     chunk_count += 1
                 if chunk_count == 0:
-                    chk = (zlib.crc32(b"") ^ adler32(b"")) & 0xFFFFFFFF
+                    chk = (zlib.crc32(b"") ^ adler32(b"", 0)) & 0xFFFFFFFF
                     checksums.append(chk)
                     chunk_count = 1
                 checksum_entries.append((chunk_count, start))
@@ -727,13 +727,13 @@ class CacheFile:
                             while len(buffer) >= CACHE_CHECKSUM_LENGTH:
                                 part = buffer[:CACHE_CHECKSUM_LENGTH]
                                 del buffer[:CACHE_CHECKSUM_LENGTH]
-                                chk = (zlib.crc32(part) ^ adler32(part)) & 0xFFFFFFFF
+                                chk = (zlib.crc32(part) ^ adler32(part, 0)) & 0xFFFFFFFF
                                 checksum_map.checksums.append(chk)
                                 chunk_count += 1
                             if remaining <= 0:
                                 break
                         block = block.next_block
-                    chk = (zlib.crc32(buffer) ^ adler32(buffer)) & 0xFFFFFFFF
+                    chk = (zlib.crc32(buffer) ^ adler32(buffer, 0)) & 0xFFFFFFFF
                     checksum_map.checksums.append(chk)
                     chunk_count += 1
                     checksum_map.entries.append((chunk_count, start))
