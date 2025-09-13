@@ -191,7 +191,8 @@ def pack_dword_list(values):
     values = list(values)
     if not values:
         return b""
-    return struct.pack(f"<{len(values)}L", *values)
+    masked = [v & 0xFFFFFFFF for v in values]
+    return struct.pack(f"<{len(masked)}L", *masked)
 
 def raise_parse_error(func):
     def internal(self, *args, **kwargs):
@@ -1706,27 +1707,27 @@ class CacheFileBlockAllocationTableEntry:
     def serialize(self):
         fmt = self.owner.owner.header.format_version
         if fmt <= 1:
-            flags = (self.dummy0 << 16) | self.entry_flags
+            flags = ((self.dummy0 & 0xFFFF) << 16) | (self.entry_flags & 0xFFFF)
             return struct.pack(
                 "<7L",
                 flags,
-                self.file_data_offset,
-                self.file_data_size,
-                self._first_sector_index,
-                self._next_block_index,
-                self._prev_block_index,
-                self.manifest_index,
+                self.file_data_offset & 0xFFFFFFFF,
+                self.file_data_size & 0xFFFFFFFF,
+                self._first_sector_index & 0xFFFFFFFF,
+                self._next_block_index & 0xFFFFFFFF,
+                self._prev_block_index & 0xFFFFFFFF,
+                self.manifest_index & 0xFFFFFFFF,
             )
         return struct.pack(
             "<2H6L",
-            self.entry_flags,
-            self.dummy0,
-            self.file_data_offset,
-            self.file_data_size,
-            self._first_sector_index,
-            self._next_block_index,
-            self._prev_block_index,
-            self.manifest_index,
+            self.entry_flags & 0xFFFF,
+            self.dummy0 & 0xFFFF,
+            self.file_data_offset & 0xFFFFFFFF,
+            self.file_data_size & 0xFFFFFFFF,
+            self._first_sector_index & 0xFFFFFFFF,
+            self._next_block_index & 0xFFFFFFFF,
+            self._prev_block_index & 0xFFFFFFFF,
+            self.manifest_index & 0xFFFFFFFF,
         )
 
 class CacheFileAllocationTable:
