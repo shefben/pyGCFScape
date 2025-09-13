@@ -206,7 +206,8 @@ class GCF:
 
             self.gotchecksums = True
 
-            if csumstart + csumsize != csumend + 0x80:
+            expected = {csumend + 0x80, csumend + 0x80 + 4}
+            if csumstart + csumsize not in expected:
                 raise Exception()
         else:
             self.gotchecksums = False

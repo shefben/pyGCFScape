@@ -504,6 +504,7 @@ class CacheFile:
                 + checksum_map.file_id_count * 8
                 + checksum_map.checksum_count * 4
                 + 128
+                + 4
             )
             self.checksum_map = checksum_map
         else:
@@ -624,7 +625,10 @@ class CacheFile:
         # Temporary owner that mirrors the structure expected by the various
         # serialisation routines.
         owner = SimpleNamespace(
-            header=header, block_entry_map=block_entry_map, blocks=blocks
+            header=header,
+            block_entry_map=block_entry_map,
+            blocks=blocks,
+            alloc_table=alloc_table,
         )
         manifest.owner = owner
         if block_entry_map:
@@ -665,6 +669,11 @@ class CacheFile:
             manifest.user_config_entries = []
             manifest.depot_info = 0
             manifest.fingerprint = 0
+        else:
+            # Modern formats always use the latest directory header layout.
+            manifest.header_version = 4
+            manifest.map_header_version = 1
+            manifest.map_dummy1 = 0
 
         # Generate a checksum map when targeting newer formats.
         if target_version > 1:
@@ -725,11 +734,29 @@ class CacheFile:
                 + checksum_map.file_id_count * 8
                 + checksum_map.checksum_count * 4
                 + 128
+                + 4
             )
             checksum_map.owner = owner
         else:
             checksum_map = None
             owner.checksum_map = None
+
+        # Allocation table properties differ between legacy and modern
+        # revisions.  Ensure the terminator and entry width match the target
+        # format and that unused entries are accounted for.
+        if target_version > 1:
+            alloc_table.is_long_terminator = 1
+            alloc_table.terminator = 0xFFFFFFFF
+            alloc_table.entries = [
+                0xFFFFFFFF if e >= 0xFFFF else e for e in alloc_table.entries
+            ]
+        else:
+            alloc_table.is_long_terminator = 0
+            alloc_table.terminator = 0xFFFF
+            alloc_table.entries = [
+                0xFFFF if e >= 0xFFFFFFFF else e for e in alloc_table.entries
+            ]
+        alloc_table.first_unused_entry = blocks.block_count
 
         # Recalculate offsets and sizes.
         header.sector_count = blocks.block_count
