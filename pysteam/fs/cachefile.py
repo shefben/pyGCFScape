@@ -77,6 +77,48 @@ def decrypt_gcf_data(data: bytes, key: bytes) -> bytes:
     return bytes(out)
 
 
+def _bobhash(k: bytes, initval: int = 1) -> int:
+    """Jenkins hash used for manifest name lookups."""
+
+    def sub(a: int, b: int) -> int:
+        return (a - b) & 0xFFFFFFFF
+
+    def xor(a: int, b: int) -> int:
+        return (a ^ b) & 0xFFFFFFFF
+
+    def mix(a: int, b: int, c: int) -> tuple[int, int, int]:
+        a = sub(a, b); a = sub(a, c); a = xor(a, c >> 13)
+        b = sub(b, c); b = sub(b, a); b = xor(b, a << 8)
+        c = sub(c, a); c = sub(c, b); c = xor(c, b >> 13)
+        a = sub(a, b); a = sub(a, c); a = xor(a, c >> 12)
+        b = sub(b, c); b = sub(b, a); b = xor(b, a << 16)
+        c = sub(c, a); c = sub(c, b); c = xor(c, b >> 5)
+        a = sub(a, b); a = sub(a, c); a = xor(a, c >> 3)
+        b = sub(b, c); b = sub(b, a); b = xor(b, a << 10)
+        c = sub(c, a); c = sub(c, b); c = xor(c, b >> 15)
+        return a, b, c
+
+    a = 0x9E3779B9
+    b = 0x9E3779B9
+    c = initval & 0xFFFFFFFF
+    origlen = len(k)
+
+    while len(k) >= 12:
+        a = (a + struct.unpack('<I', k[0:4])[0]) & 0xFFFFFFFF
+        b = (b + struct.unpack('<I', k[4:8])[0]) & 0xFFFFFFFF
+        c = (c + struct.unpack('<I', k[8:12])[0]) & 0xFFFFFFFF
+        a, b, c = mix(a, b, c)
+        k = k[12:]
+
+    c = (c + origlen) & 0xFFFFFFFF
+    k = k.ljust(11, b'\x00')
+    a = (a + struct.unpack('<I', k[0:4])[0]) & 0xFFFFFFFF
+    b = (b + struct.unpack('<I', k[4:8])[0]) & 0xFFFFFFFF
+    c = (c + struct.unpack('<I', b'\x00' + k[8:11])[0]) & 0xFFFFFFFF
+    a, b, c = mix(a, b, c)
+    return c & 0xFFFFFFFF
+
+
 def unpack_dword_list(stream, count):
     """Return ``count`` little-endian DWORDs from ``stream`` as a list.
 
@@ -309,6 +351,7 @@ class CacheFile:
             node[parts[-1]] = data
 
         file_nodes: list[tuple[int, bytes]] = []
+        checksum_entries: list[tuple[int, int]] = []
         checksums: list[int] = []
 
         def add_entry(obj: object, name: str, parent: int, path: str) -> int:
@@ -323,7 +366,7 @@ class CacheFile:
             if isinstance(obj, dict):
                 # Directory
                 entry.item_size = 0
-                entry.checksum_index = 0
+                entry.checksum_index = 0xFFFFFFFF
                 entry.directory_flags = flags.get(path, 0)
                 manifest.manifest_entries.append(entry)
                 manifest.manifest_map_entries.append(0xFFFFFFFF)
@@ -331,6 +374,7 @@ class CacheFile:
                 for child_name in sorted(obj):
                     child_path = path + "/" + child_name if path else child_name
                     children.append(add_entry(obj[child_name], child_name, index, child_path))
+                entry.item_size = len(children)
                 if children:
                     entry.child_index = children[0]
                     for a, b in zip(children, children[1:]):
@@ -339,12 +383,26 @@ class CacheFile:
                 # File
                 data = obj  # type: ignore[assignment]
                 entry.item_size = len(data)
-                entry.checksum_index = len(checksums)
-                entry.directory_flags = flags.get(path, 0) | CacheFileManifestEntry.FLAG_IS_FILE
+                entry.checksum_index = len(checksum_entries)
+                entry.directory_flags = (
+                    flags.get(path, 0) | CacheFileManifestEntry.FLAG_IS_FILE
+                )
                 manifest.manifest_entries.append(entry)
                 manifest.manifest_map_entries.append(0)
                 file_nodes.append((index, data))
-                checksums.append(zlib.crc32(data) & 0xFFFFFFFF)
+
+                start = len(checksums)
+                chunk_count = 0
+                for offset in range(0, len(data), CACHE_CHECKSUM_LENGTH):
+                    chunk = data[offset : offset + CACHE_CHECKSUM_LENGTH]
+                    chk = (zlib.crc32(chunk) ^ adler32(chunk)) & 0xFFFFFFFF
+                    checksums.append(chk)
+                    chunk_count += 1
+                if chunk_count == 0:
+                    chk = (zlib.crc32(b"") ^ adler32(b"")) & 0xFFFFFFFF
+                    checksums.append(chk)
+                    chunk_count = 1
+                checksum_entries.append((chunk_count, start))
             return index
 
         add_entry(root, "", 0xFFFFFFFF, "")
@@ -352,24 +410,53 @@ class CacheFile:
         manifest.filename_table = bytes(filename_table)
         manifest.node_count = len(manifest.manifest_entries)
         manifest.file_count = len(file_nodes)
-        manifest.hash_table_indices = list(range(manifest.node_count))
+
+        # Build manifest hash table used for name lookups
+        bucket_count = 1 << ((manifest.node_count * 2 - 1).bit_length())
+        buckets: list[list[int]] = [[] for _ in range(bucket_count)]
+        for entry in manifest.manifest_entries:
+            off = entry.name_offset
+            end = manifest.filename_table.index(b"\0", off)
+            name = manifest.filename_table[off:end].lower()
+            h = _bobhash(name)
+            buckets[h & (bucket_count - 1)].append(entry.index)
+
+        hash_table_keys = [0xFFFFFFFF] * bucket_count
+        hash_table_indices: list[int] = []
+        for i, bucket in enumerate(buckets):
+            if not bucket:
+                continue
+            hash_table_keys[i] = bucket_count + len(hash_table_indices)
+            for j, idx in enumerate(bucket):
+                val = idx | (0x80000000 if j == len(bucket) - 1 else 0)
+                hash_table_indices.append(val)
+
+        manifest.hash_table_keys = hash_table_keys
+        manifest.hash_table_indices = hash_table_indices
         manifest.owner = self
         self.manifest = manifest
 
         # ------------------------------------------------------------------
         # Checksum map
         # ------------------------------------------------------------------
-        if checksums:
+        if checksum_entries:
             checksum_map = CacheFileChecksumMap(self)
             checksum_map.header_version = 1
-            checksum_map.checksum_size = 4
-            checksum_map.format_code = 1
+            checksum_map.checksum_size = 0  # placeholder, recomputed below
+            # External validators expect a magic value in the "format" field.
+            checksum_map.format_code = 0x14893721
             checksum_map.version = 1
-            checksum_map.entries = [(1, i) for i in range(len(checksums))]
+            checksum_map.entries = checksum_entries
             checksum_map.checksums = checksums
-            checksum_map.file_id_count = len(checksums)
+            checksum_map.file_id_count = len(checksum_entries)
             checksum_map.checksum_count = len(checksums)
             checksum_map.signature = b"\0" * 128
+            checksum_map.checksum_size = (
+                16
+                + checksum_map.file_id_count * 8
+                + checksum_map.checksum_count * 4
+                + 128
+            )
             self.checksum_map = checksum_map
         else:
             self.checksum_map = None
@@ -520,8 +607,7 @@ class CacheFile:
             manifest.application_id = header.application_id
             manifest.application_version = header.application_version
             manifest.compression_block_size = header.sector_size
-            manifest.hash_table_keys = []
-            manifest.hash_table_indices = [0] * manifest.node_count
+            # Retain the hash table so external validators can resolve names.
             manifest.minimum_footprint_entries = []
             manifest.user_config_entries = []
             manifest.depot_info = 0
@@ -532,20 +618,23 @@ class CacheFile:
             if checksum_map is None:
                 checksum_map = CacheFileChecksumMap(owner)
                 checksum_map.header_version = 1
-                checksum_map.checksum_size = 4
-                checksum_map.format_code = 1
+                checksum_map.checksum_size = 0  # placeholder, recomputed below
+                checksum_map.format_code = 0x14893721
                 checksum_map.version = 1
                 checksum_map.entries = []
                 checksum_map.checksums = []
                 checksum_map.signature = b"\0" * 128
-                for entry in self.manifest.manifest_entries:
+                for entry in manifest.manifest_entries:
                     if not (
                         entry.directory_flags & CacheFileManifestEntry.FLAG_IS_FILE
                     ):
                         continue
-                    crc = 0
+                    entry.checksum_index = len(checksum_map.entries)
+                    start = len(checksum_map.checksums)
+                    chunk_count = 0
                     remaining = entry.item_size
                     block = entry.first_block
+                    buffer = bytearray()
                     while block is not None and remaining > 0:
                         for sector in block.sectors:
                             if remaining <= 0:
@@ -557,15 +646,31 @@ class CacheFile:
                             chunk = self.stream.read(
                                 min(remaining, self.header.sector_size)
                             )
-                            crc = zlib.crc32(chunk, crc)
+                            buffer.extend(chunk)
                             remaining -= len(chunk)
+                            while len(buffer) >= CACHE_CHECKSUM_LENGTH:
+                                part = buffer[:CACHE_CHECKSUM_LENGTH]
+                                del buffer[:CACHE_CHECKSUM_LENGTH]
+                                chk = (zlib.crc32(part) ^ adler32(part)) & 0xFFFFFFFF
+                                checksum_map.checksums.append(chk)
+                                chunk_count += 1
                             if remaining <= 0:
                                 break
                         block = block.next_block
-                    checksum_map.entries.append((1, len(checksum_map.checksums)))
-                    checksum_map.checksums.append(crc & 0xFFFFFFFF)
-                checksum_map.file_id_count = len(checksum_map.entries)
-                checksum_map.checksum_count = len(checksum_map.checksums)
+                    chk = (zlib.crc32(buffer) ^ adler32(buffer)) & 0xFFFFFFFF
+                    checksum_map.checksums.append(chk)
+                    chunk_count += 1
+                    checksum_map.entries.append((chunk_count, start))
+            else:
+                checksum_map.format_code = 0x14893721
+            checksum_map.file_id_count = len(checksum_map.entries)
+            checksum_map.checksum_count = len(checksum_map.checksums)
+            checksum_map.checksum_size = (
+                16
+                + checksum_map.file_id_count * 8
+                + checksum_map.checksum_count * 4
+                + 128
+            )
             checksum_map.owner = owner
         else:
             checksum_map = None
@@ -1685,27 +1790,25 @@ class CacheFileManifest:
         self.num_of_user_config_files = len(self.user_config_entries)
         self.num_of_minimum_footprint_files = len(self.minimum_footprint_entries)
         self.name_size = len(self.filename_table)
-        self.binary_size = 56 + 32 * self.node_count + self.name_size + 4 * (
-            self.hash_table_key_count
-            + self.num_of_user_config_files
-            + self.num_of_minimum_footprint_files
-        )
 
-        manifest_data_parts = []
+        body_parts = []
         for i in self.manifest_entries:
-            manifest_data_parts.append(i.serialize())
+            body_parts.append(i.serialize())
 
-        manifest_data_parts.append(self.filename_table)
-        manifest_data_parts.append(pack_dword_list(self.hash_table_keys))
-        manifest_data_parts.append(pack_dword_list(self.hash_table_indices))
-        manifest_data_parts.append(pack_dword_list(self.minimum_footprint_entries))
-        manifest_data_parts.append(pack_dword_list(self.user_config_entries))
+        body_parts.append(self.filename_table)
+        body_parts.append(pack_dword_list(self.hash_table_keys))
+        body_parts.append(pack_dword_list(self.hash_table_indices))
+        body_parts.append(pack_dword_list(self.minimum_footprint_entries))
+        body_parts.append(pack_dword_list(self.user_config_entries))
+        manifest_body = b"".join(body_parts)
+
+        extra_parts = []
         if self.owner.header.format_version > 1:
-            manifest_data_parts.append(
-                struct.pack("<2L", self.map_header_version, self.map_dummy1)
-            )
-        manifest_data_parts.append(pack_dword_list(self.manifest_map_entries))
-        manifest_data = b"".join(manifest_data_parts)
+            extra_parts.append(struct.pack("<2L", self.map_header_version, self.map_dummy1))
+        extra_parts.append(pack_dword_list(self.manifest_map_entries))
+        extra_data = b"".join(extra_parts)
+
+        self.binary_size = 56 + len(manifest_body)
 
         header_without_checksum = struct.pack(
             "<13L",
@@ -1725,8 +1828,16 @@ class CacheFileManifest:
         )
         self.header_data = header_without_checksum
 
-        self.checksum = adler32(header_without_checksum + b"\0\0\0\0" + manifest_data, 0) & 0xFFFFFFFF
-        return header_without_checksum + struct.pack("<L", self.checksum) + manifest_data
+        checksum_header = header_without_checksum[:-4] + b"\0\0\0\0"
+        self.checksum = (
+            adler32(checksum_header + b"\0\0\0\0" + manifest_body, 0) & 0xFFFFFFFF
+        )
+        return (
+            header_without_checksum
+            + struct.pack("<L", self.checksum)
+            + manifest_body
+            + extra_data
+        )
 
     def validate(self):
         if self.owner.header.application_id != self.application_id:
@@ -1748,7 +1859,10 @@ class CacheFileManifest:
     def calculate_checksum(self):
         # Blank out checksum and fingerprint + hack to get unsigned value.
         data = self.serialize()
-        return adler32(data[:48] + b"\0\0\0\0\0\0\0\0" + data[56:], 0) & 0xffffffff
+        body_end = self.binary_size
+        return adler32(
+            data[:48] + b"\0\0\0\0\0\0\0\0" + data[56:body_end], 0
+        ) & 0xFFFFFFFF
 
 class CacheFileManifestEntry:
 
