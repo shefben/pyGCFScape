@@ -9,10 +9,7 @@ def test_fragment_block_maps(tmp_path):
     cf.convert_version(6, out_v6)
     rebuilt_v6 = CacheFile.parse(out_v6)
 
-    assert rebuilt_v6.block_entry_map is not None
-    assert rebuilt_v6.block_entry_map.entries == list(
-        range(rebuilt_v6.blocks.block_count)
-    )
+    assert rebuilt_v6.block_entry_map is None
 
     entry = rebuilt_v6.root["big.bin"]._manifest_entry
     first = rebuilt_v6.manifest.manifest_map_entries[entry.index]

@@ -4,7 +4,7 @@ All discrepancies identified from the v6 specification have been resolved. The g
 matches the documented layout:
 
 - Block allocation entries use 16‑bit flag and dummy fields.
-- A block‑entry map is emitted for every archive.
+- Block‑entry maps are only written for legacy formats (v1–v5).
 - Manifest headers receive a randomized fingerprint on each build.
 - Checksum maps carry an RSA signature and only store the latest application version in the footer.
 - Block entry flags are configurable per file instead of hard‑coded.

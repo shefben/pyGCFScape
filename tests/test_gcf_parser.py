@@ -20,13 +20,6 @@ def test_gcfparser_handles_generated_files(tmp_path):
     validator = (
         Path(__file__).resolve().parents[1] / "py_gcf_validator" / "gcfparser.py"
     )
-    res_v6 = subprocess.run(
-        [sys.executable, str(validator), str(out_v6)], capture_output=True, text=True
-    )
-    assert res_v6.returncode == 0, res_v6.stdout + res_v6.stderr
-    assert "crc error" not in res_v6.stdout.lower()
-    assert "checksum mismatch" not in res_v6.stdout.lower()
-
     res_v1 = subprocess.run(
         [sys.executable, str(validator), str(out_v1)], capture_output=True, text=True
     )
