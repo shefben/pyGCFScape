@@ -446,11 +446,11 @@ class CacheFile:
                 chunk_count = 0
                 for offset in range(0, len(data), CACHE_CHECKSUM_LENGTH):
                     chunk = data[offset : offset + CACHE_CHECKSUM_LENGTH]
-                    chk = (zlib.crc32(chunk) ^ adler32(chunk, 0)) & 0xFFFFFFFF
+                    chk = (adler32(chunk, 0) ^ zlib.crc32(chunk, 0)) & 0xFFFFFFFF
                     checksums.append(chk)
                     chunk_count += 1
                 if chunk_count == 0:
-                    chk = (zlib.crc32(b"") ^ adler32(b"", 0)) & 0xFFFFFFFF
+                    chk = (adler32(b"", 0) ^ zlib.crc32(b"", 0)) & 0xFFFFFFFF
                     checksums.append(chk)
                     chunk_count = 1
                 checksum_entries.append((chunk_count, start))
@@ -508,7 +508,6 @@ class CacheFile:
                 + checksum_map.file_id_count * 8
                 + checksum_map.checksum_count * 4
                 + 128
-                + 4
             )
             self.checksum_map = checksum_map
         else:
@@ -687,6 +686,9 @@ class CacheFile:
             manifest.header_version = 4
             manifest.map_header_version = 1
             manifest.map_dummy1 = 0
+            # V6 requires CompressionBlockSize = 0x8000 (32KB)
+            if target_version == 6:
+                manifest.compression_block_size = 0x8000
 
         # Generate a checksum map when targeting newer formats.
         if target_version > 1:
@@ -727,13 +729,13 @@ class CacheFile:
                             while len(buffer) >= CACHE_CHECKSUM_LENGTH:
                                 part = buffer[:CACHE_CHECKSUM_LENGTH]
                                 del buffer[:CACHE_CHECKSUM_LENGTH]
-                                chk = (zlib.crc32(part) ^ adler32(part, 0)) & 0xFFFFFFFF
+                                chk = (adler32(part, 0) ^ zlib.crc32(part, 0)) & 0xFFFFFFFF
                                 checksum_map.checksums.append(chk)
                                 chunk_count += 1
                             if remaining <= 0:
                                 break
                         block = block.next_block
-                    chk = (zlib.crc32(buffer) ^ adler32(buffer, 0)) & 0xFFFFFFFF
+                    chk = (adler32(buffer, 0) ^ zlib.crc32(buffer, 0)) & 0xFFFFFFFF
                     checksum_map.checksums.append(chk)
                     chunk_count += 1
                     checksum_map.entries.append((chunk_count, start))
@@ -747,7 +749,6 @@ class CacheFile:
                 + checksum_map.file_id_count * 8
                 + checksum_map.checksum_count * 4
                 + 128
-                + 4
             )
             checksum_map.owner = owner
         else:
@@ -1334,7 +1335,7 @@ class CacheFile:
                 if len(chunk) != to_read:
                     return "size mismatch"
                 chk = (adler32(chunk, 0) & 0xFFFFFFFF) ^ (
-                    zlib.crc32(chunk) & 0xFFFFFFFF
+                    zlib.crc32(chunk, 0) & 0xFFFFFFFF
                 )
                 if chk != self.checksum_map.checksums[first + i]:
                     return "checksum mismatch"
@@ -1485,7 +1486,7 @@ class CacheFileHeader:
     def serialize(self):
         data = struct.pack("<10L", self.header_version, self.cache_type, self.format_version, self.application_id,
                            self.application_version, self.is_mounted, self.dummy1, self.file_size, self.sector_size, self.sector_count)
-        self.checksum = sum(data)
+        self.checksum = sum(data) & 0xFFFFFFFF
         return data + struct.pack("<L", self.checksum)
 
     def calculate_checksum(self):
@@ -2049,6 +2050,19 @@ class CacheFileManifest:
                     "Invalid Cache File Manifest [ManifestHeaderMap's Dummy1 is not 0]"
                 )
 
+        # Validate CompressionBlockSize according to format version
+        if self.owner.header.format_version <= 1:
+            if self.compression_block_size != self.owner.header.sector_size:
+                raise ValueError(
+                    f"V1 CompressionBlockSize must equal SectorSize ({self.owner.header.sector_size}), "
+                    f"got {self.compression_block_size}"
+                )
+        elif self.owner.header.format_version == 6:
+            if self.compression_block_size != 0x8000:
+                raise ValueError(
+                    f"V6 CompressionBlockSize must be 0x8000, got {self.compression_block_size}"
+                )
+
     def calculate_checksum(self):
         # Blank out checksum and fingerprint + hack to get unsigned value.
         data = self.serialize()
@@ -2183,7 +2197,7 @@ class CacheFileChecksumMap:
         if len(getattr(self, "signature", b"")) != 128:
             self.signature = _rsa_pkcs1_sha1_sign(payload)
         return b"".join(
-            [payload, self.signature, struct.pack("<L", self.latest_application_version)]
+            [payload, self.signature]
         )
 
     def verify_signature(self) -> bool:

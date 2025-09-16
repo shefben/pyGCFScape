@@ -98,11 +98,10 @@ class GCF:
         blank = None
         used = None
         for i in range(self.MaxEntries):
-            flags_low, dummy0, offset, filesize, firstblock, nextblock, prevblock, manifest_idx = struct.unpack(
-                "<2H6I", self.f.read(28)
-            )
-            flags = (dummy0 << 16) | flags_low
-            entry = (flags, offset, filesize, firstblock, nextblock, prevblock, manifest_idx)
+            entry = struct.unpack("<7I", self.f.read(7 * 4))
+            #print("entry", i, hex(self.f.tell()), entry)
+            
+            flags, offset, filesize, firstblock, nextblock, prevblock, manifest_idx = entry
             
             if flags & 0x8000 == 0:
                 # not used
@@ -144,18 +143,20 @@ class GCF:
         for i in range(self.MaxEntries):
             self.fragmap.append(struct.unpack("<I", self.f.read(4))[0])
             
-        print("block map start", hex(self.f.tell()))
+        if self.CacheVersion <= 5:
+            print("block map start", hex(self.f.tell()))
 
-        numblocks2, firstentry, lastentry, dunno = self._read_header_with_csum32(4)
+            numblocks2, firstentry, lastentry, dunno = self._read_header_with_csum32(4)
 
-        self.usagemap = []
-        for i in range(self.MaxEntries):
-            self.usagemap.append(struct.unpack("<II", self.f.read(8)))
+            self.usagemap = []
+            for i in range(self.MaxEntries):
+                self.usagemap.append(struct.unpack("<II", self.f.read(8)))
             
         print("manifest start", hex(self.f.tell()))
         
         # read manifest from file stream
         self.manif = Manifest(self.f, adjust_size=True)
+        open("manifesttest.manif", "wb").write(self.manif.fulldata)
         
         if self.manif.adjusted:
             print("DID ADJUSTMENT")
@@ -198,16 +199,14 @@ class GCF:
             self.checksums = []
             for i in range(csumcount):
                 self.checksums.append(struct.unpack("<I", self.f.read(4))[0])
-
+                
             csumend = self.f.tell()
             csumsignature = self.f.read(0x80)
-            latest_ver = struct.unpack("<I", self.f.read(4))[0]
             print("csum size", hex(csumend - csumstart), "csum signature", csumsignature.hex())
-
+            
             self.gotchecksums = True
-
-            expected = {csumend + 0x80, csumend + 0x80 + 4}
-            if csumstart + csumsize not in expected:
+                
+            if csumstart + csumsize != self.f.tell():
                 raise Exception()
         else:
             self.gotchecksums = False
