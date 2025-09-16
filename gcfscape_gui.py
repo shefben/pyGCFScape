@@ -123,6 +123,76 @@ def is_encrypted(entry) -> bool:
     return bool(manifest.directory_flags & CacheFileManifestEntry.FLAG_IS_ENCRYPTED)
 
 
+# Mapping of manifest flag bits to user-facing display names.  The
+# ``CacheFileManifestEntry`` exposes the raw constant names which are not always
+# pleasant to show in the UI.  These mappings keeps the labels consistent
+# between the flags menu and the exported report.
+FLAG_MENU_ORDER = [
+    CacheFileManifestEntry.FLAG_IS_EXECUTABLE,
+    CacheFileManifestEntry.FLAG_IS_HIDDEN,
+    CacheFileManifestEntry.FLAG_IS_READ_ONLY,
+    CacheFileManifestEntry.FLAG_IS_ENCRYPTED,
+    CacheFileManifestEntry.FLAG_IS_PURGE_FILE,
+    CacheFileManifestEntry.FLAG_BACKUP_PLZ,
+    CacheFileManifestEntry.FLAG_IS_NO_CACHE,
+    CacheFileManifestEntry.FLAG_IS_LOCKED,
+    CacheFileManifestEntry.FLAG_IS_LAUNCH,
+    CacheFileManifestEntry.FLAG_IS_USER_CONFIG,
+]
+
+_FLAG_NAME_OVERRIDES = {
+    CacheFileManifestEntry.FLAG_IS_EXECUTABLE: "Executable",
+    CacheFileManifestEntry.FLAG_IS_HIDDEN: "Hidden",
+    CacheFileManifestEntry.FLAG_IS_READ_ONLY: "Read Only",
+    CacheFileManifestEntry.FLAG_IS_ENCRYPTED: "Encrypted",
+    CacheFileManifestEntry.FLAG_IS_PURGE_FILE: "Purge",
+    CacheFileManifestEntry.FLAG_BACKUP_PLZ: "Backup Before Overwrite",
+    CacheFileManifestEntry.FLAG_IS_NO_CACHE: "No Cache",
+    CacheFileManifestEntry.FLAG_IS_LOCKED: "Locked",
+    CacheFileManifestEntry.FLAG_IS_LAUNCH: "Launch",
+    CacheFileManifestEntry.FLAG_IS_USER_CONFIG: "Configuration",
+    CacheFileManifestEntry.FLAG_IS_FILE: "File",
+}
+
+
+def _build_flag_display_names() -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    for attr in dir(CacheFileManifestEntry):
+        if not attr.startswith("FLAG_"):
+            continue
+        bit = getattr(CacheFileManifestEntry, attr)
+        label = attr.replace("FLAG_", "").replace("_", " ").title()
+        mapping[bit] = _FLAG_NAME_OVERRIDES.get(bit, label)
+    return mapping
+
+
+FLAG_DISPLAY_NAMES = _build_flag_display_names()
+FLAG_MENU_ORDER = [bit for bit in FLAG_MENU_ORDER if bit in FLAG_DISPLAY_NAMES]
+FLAG_MENU_ORDER_SET = set(FLAG_MENU_ORDER)
+
+
+def describe_manifest_flags(flags: int) -> list[str]:
+    """Return friendly flag names for the given manifest ``flags`` value."""
+
+    names: list[str] = []
+    remaining = flags
+    for bit in FLAG_MENU_ORDER:
+        if flags & bit:
+            names.append(FLAG_DISPLAY_NAMES.get(bit, f"0x{bit:08X}"))
+            remaining &= ~bit
+    for bit, name in sorted(FLAG_DISPLAY_NAMES.items()):
+        if bit in FLAG_MENU_ORDER_SET:
+            continue
+        if flags & bit:
+            names.append(name)
+            remaining &= ~bit
+    while remaining:
+        bit = remaining & -remaining
+        names.append(f"0x{bit:08X}")
+        remaining &= ~bit
+    return names
+
+
 # ---------------------------------------------------------------------------
 # Utility widgets and helpers
 # ---------------------------------------------------------------------------
@@ -968,23 +1038,14 @@ class GCFScapeWindow(QMainWindow):
         self.minimum_footprint_action.toggled.connect(
             self._toggle_minimum_footprint
         )
-        flag_defs = [
-            ("Executable", CacheFileManifestEntry.FLAG_IS_EXECUTABLE),
-            ("Hidden", CacheFileManifestEntry.FLAG_IS_HIDDEN),
-            ("Read Only", CacheFileManifestEntry.FLAG_IS_READ_ONLY),
-            ("Encrypted", CacheFileManifestEntry.FLAG_IS_ENCRYPTED),
-            ("Purge", CacheFileManifestEntry.FLAG_IS_PURGE_FILE),
-            ("Backup Before Overwrite", CacheFileManifestEntry.FLAG_BACKUP_PLZ),
-            ("No Cache", CacheFileManifestEntry.FLAG_IS_NO_CACHE),
-            ("Locked", CacheFileManifestEntry.FLAG_IS_LOCKED),
-            ("Launch", CacheFileManifestEntry.FLAG_IS_LAUNCH),
-            ("Configuration", CacheFileManifestEntry.FLAG_IS_USER_CONFIG),
-        ]
         self.flag_actions = {}
-        for text, bit in flag_defs:
+        for bit in FLAG_MENU_ORDER:
+            text = FLAG_DISPLAY_NAMES.get(bit, f"0x{bit:08X}")
             act = QAction(text, self, checkable=True)
             act.toggled.connect(lambda checked, b=bit: self._toggle_flag(b, checked))
             self.flag_actions[bit] = act
+        self.export_flag_list_action = QAction("Export file flag list", self)
+        self.export_flag_list_action.triggered.connect(self._export_flag_list)
         self._enable_edit_actions(False)
 
         self.refresh_action = QAction("&Refresh", self)
@@ -1052,6 +1113,8 @@ class GCFScapeWindow(QMainWindow):
         for act in self.flag_actions.values():
             self.flags_menu.addAction(act)
         self.flags_menu.aboutToShow.connect(self._sync_flag_menu)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.export_flag_list_action)
 
         view_menu = menubar.addMenu("&View")
         view_menu.addAction(self.expand_action)
@@ -1269,6 +1332,67 @@ class GCFScapeWindow(QMainWindow):
             act.blockSignals(True)
             act.setChecked(bool(common & bit))
             act.blockSignals(False)
+
+    def _export_flag_list(self) -> None:
+        if not self.cachefile:
+            return
+
+        root = getattr(self.cachefile, "root", None)
+        if root is None or not hasattr(root, "all_files"):
+            QMessageBox.warning(
+                self,
+                "Export File Flag List",
+                "The current archive does not expose file information.",
+            )
+            return
+
+        default = ""
+        if self.current_path:
+            try:
+                default = str(Path(self.current_path).with_suffix(".flags.txt"))
+            except Exception:
+                default = ""
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export File Flag List",
+            default,
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            entries = sorted(root.all_files(), key=lambda e: e.path().lower())
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Export File Flag List",
+                f"Failed to enumerate files: {exc}",
+            )
+            return
+
+        output_path = Path(path)
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open("w", encoding="utf-8") as stream:
+                stream.write("Path\tFlags\tFlag Names\n")
+                for entry in entries:
+                    flags = getattr(entry, "flags", 0)
+                    names = describe_manifest_flags(flags)
+                    name_str = ", ".join(names) if names else "None"
+                    stream.write(
+                        f"{_entry_location(entry)}\t{hex(flags)}\t{name_str}\n"
+                    )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Export File Flag List",
+                f"Failed to export flag list: {exc}",
+            )
+            return
+
+        self.statusBar().showMessage(f"Flag list exported to {output_path}")
 
     def _update_status_info(self) -> None:
         if not self.cachefile or not self.current_path:
@@ -1499,6 +1623,11 @@ class GCFScapeWindow(QMainWindow):
         self.save_action.setEnabled(enabled and hasattr(self.cachefile, "save"))
         if hasattr(self, "flags_menu"):
             self.flags_menu.setEnabled(False)
+        self._update_export_flag_action()
+
+    def _update_export_flag_action(self) -> None:
+        if hasattr(self, "export_flag_list_action"):
+            self.export_flag_list_action.setEnabled(self.cachefile is not None)
 
     # ------------------------------------------------------------------
     # File operations
