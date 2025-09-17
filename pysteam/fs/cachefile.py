@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from typing import Optional, Callable
 
 from pysteam.fs import DirectoryFolder, DirectoryFile, FilesystemPackage
+from py_gcf_validator.bobhash import bobhash as _bobhash
+from .gcf_v1 import prepare_manifest_for_v1
 from math import ceil
 from zlib import adler32
 
@@ -511,21 +513,10 @@ class CacheFile:
             block_entry_map = None
             owner.block_entry_map = None
 
-        # Older directory headers differ significantly from newer manifest
-        # layouts.  When targeting version 1 we rewrite the manifest header
-        # fields to mirror the legacy structure described in ``GCFDirectoryHeader``
-        # from HLLib:
+        # The v1 generator follows a slightly different manifest layout.
+        # Reuse the dedicated helper so our output mirrors the legacy tool.
         if target_version == 1:
-            manifest.header_version = 4  # uiDummy0 constant
-            manifest.application_id = header.application_id
-            manifest.application_version = header.application_version
-            manifest.compression_block_size = header.sector_size
-            manifest.hash_table_keys = []
-            manifest.hash_table_indices = [0] * manifest.node_count
-            manifest.minimum_footprint_entries = []
-            manifest.user_config_entries = []
-            manifest.depot_info = 0
-            manifest.fingerprint = 0
+            prepare_manifest_for_v1(manifest)
 
         # Generate a checksum map when targeting newer formats.
         if target_version > 1:
