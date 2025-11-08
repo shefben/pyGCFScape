@@ -5,6 +5,8 @@ import struct
 import os
 import zlib
 import copy
+import hashlib
+import secrets
 from types import SimpleNamespace
 
 from typing import Optional, Callable
@@ -26,9 +28,46 @@ except Exception:  # pragma: no cover - handled at runtime
 CACHE_CHECKSUM_LENGTH = 0x8000
 GCF_DEFAULT_SECTOR_SIZE = 0x2000
 
+# RSA key constants for GCF signature generation/validation
+_RSA_N = int(
+    "882750d6bbbe60c87025d56dcf85361f0594d35d20f0288d33809d35836d251a00f9673d839a"
+    "ffd6ee6dfd9334ca50702af4f57762fe28b1f59a05ced97db929709c68868c9d8e70c07ab6bf1"
+    "edc0f9f38d7ee3f0932bcd6113f04d2e03688b344f6837a5d4d088d9c34b79548eb1673040e891"
+    "97905a995264f5ef7b7128db1",
+    16,
+)
+_RSA_D = int(
+    "812cdbf37f183676b48010a82874f84e225b7ad52684f3d45382b8a4a6d68c96c949d67b743b4"
+    "073c8aeae2055bb84e986b7f59399660d7219d451a1d188d231da52185ca107735d3b751e02537"
+    "e2e62b6db9b9307566fbe7e20759ff9594cbd75572dd8672690211c5180a501a47de534ab1e2e6"
+    "a10509df8e29b73fe9b2669",
+    16,
+)
+_RSA_E = 65537
+_RSA_PREFIX = bytes.fromhex("3021300906052b0e03021a05000414")
 
 STEAM_TERMINATOR = "\\"  # Archive path separator
 MAX_FILENAME = 0
+
+
+def _rsa_pkcs1_sha1_sign(data: bytes) -> bytes:
+    """Generate PKCS#1 v1.5 RSA signature with SHA-1 hash."""
+    digest = hashlib.sha1(data).digest()
+    k = (_RSA_N.bit_length() + 7) // 8
+    ps = b"\xff" * (k - len(_RSA_PREFIX) - len(digest) - 3)
+    em = b"\x00\x01" + ps + b"\x00" + _RSA_PREFIX + digest
+    m = int.from_bytes(em, "big")
+    return pow(m, _RSA_D, _RSA_N).to_bytes(k, "big")
+
+
+def _rsa_pkcs1_sha1_verify(data: bytes, sig: bytes) -> bool:
+    """Verify PKCS#1 v1.5 RSA signature with SHA-1 hash."""
+    digest = hashlib.sha1(data).digest()
+    k = (_RSA_N.bit_length() + 7) // 8
+    m = pow(int.from_bytes(sig, "big"), _RSA_E, _RSA_N).to_bytes(k, "big")
+    ps = b"\xff" * (k - len(_RSA_PREFIX) - len(digest) - 3)
+    expected = b"\x00\x01" + ps + b"\x00" + _RSA_PREFIX + digest
+    return m == expected
 
 
 def _normalize_key(key: bytes) -> bytes:
@@ -110,11 +149,15 @@ def unpack_dword_list(stream, count):
 
 
 def pack_dword_list(values):
-    """Pack an iterable of integers into little-endian DWORD bytes."""
+    """Pack an iterable of integers into little-endian DWORD bytes.
+
+    Masks each value to 32 bits to prevent struct.pack errors on oversized values.
+    """
     values = list(values)
     if not values:
         return b""
-    return struct.pack(f"<{len(values)}L", *values)
+    masked = [v & 0xFFFFFFFF for v in values]
+    return struct.pack(f"<{len(masked)}L", *masked)
 
 def raise_parse_error(func):
     def internal(self, *args, **kwargs):
@@ -218,6 +261,7 @@ class CacheFile:
             # Data Header.
             self.data_header = CacheFileSectorHeader(self)
             header_size = 24 if self.header.format_version > 3 else 20
+            pos = stream.tell()
             self.data_header.parse(stream.read(header_size), self.header.format_version)
             self.data_header.validate()
 
@@ -243,18 +287,88 @@ class CacheFile:
                 self.stream = None
 
     @classmethod
+    def build_version(
+        cls,
+        files: dict[str, bytes],
+        target_version: int,
+        out_path: str,
+        app_id: int = 0,
+        app_version: int = 0,
+        flags: dict[str, int] | None = None,
+        block_flags: dict[str, int] | None = None,
+        manifest_flags: int = 0,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> None:
+        """Build and save a GCF file directly at the specified version.
+
+        This is a convenience method that combines build() and convert_version()
+        into a single operation for creating GCF files from scratch.
+
+        Parameters
+        ----------
+        files : dict[str, bytes]
+            Mapping of file paths to file contents
+        target_version : int
+            Target GCF format version (1, 3, 5, or 6)
+        out_path : str
+            Destination path for the GCF file
+        app_id : int
+            Steam application ID
+        app_version : int
+            Application version
+        flags : dict[str, int] | None
+            Mapping of file paths to manifest entry flags
+        block_flags : dict[str, int] | None
+            Mapping of file paths to block entry flags
+        manifest_flags : int
+            Manifest bitmask flags
+        progress : Callable[[int, int], None] | None
+            Optional progress callback
+        """
+        if target_version not in (1, 3, 5, 6):
+            raise ValueError(f"Unsupported GCF version: {target_version}")
+
+        cf = cls.build(
+            files,
+            app_id=app_id,
+            app_version=app_version,
+            flags=flags,
+            block_flags=block_flags,
+            manifest_flags=manifest_flags,
+        )
+        cf.convert_version(target_version, out_path, progress=progress)
+        cf.close()
+
+    @classmethod
     def build(
         cls,
         files: dict[str, bytes],
         app_id: int = 0,
         app_version: int = 0,
         flags: dict[str, int] | None = None,
+        block_flags: dict[str, int] | None = None,
+        manifest_flags: int = 0,
     ) -> "CacheFile":
         """Construct a new :class:`CacheFile` from a mapping of paths to data.
 
         The returned cache file lives in memory using the latest GCF format
         (version 6).  Call :meth:`convert_version` to serialise it to disk in
         any supported revision.
+
+        Parameters
+        ----------
+        files : dict[str, bytes]
+            Mapping of file paths to file contents
+        app_id : int
+            Steam application ID
+        app_version : int
+            Application version
+        flags : dict[str, int] | None
+            Mapping of file paths to manifest entry flags
+        block_flags : dict[str, int] | None
+            Mapping of file paths to block entry flags
+        manifest_flags : int
+            Manifest bitmask flags
         """
 
         self = cls()
@@ -284,12 +398,12 @@ class CacheFile:
         # Manifest construction
         # ------------------------------------------------------------------
         manifest = CacheFileManifest(self)
-        manifest.header_version = 3
+        manifest.header_version = 4  # v6 uses header version 4
         manifest.application_id = app_id
         manifest.application_version = app_version
-        manifest.compression_block_size = sector_size
-        manifest.depot_info = 2
-        manifest.fingerprint = 0
+        manifest.compression_block_size = CACHE_CHECKSUM_LENGTH  # v6 uses 0x8000
+        manifest.depot_info = manifest_flags
+        manifest.fingerprint = secrets.randbits(32)  # Random fingerprint per spec
         manifest.manifest_entries = []
         manifest.hash_table_keys = []
         manifest.hash_table_indices = []
@@ -298,10 +412,12 @@ class CacheFile:
         manifest.manifest_map_entries = []
         manifest.map_header_version = 1
         manifest.map_dummy1 = 0
-        filename_table = bytearray(b"\0")
+        # Start with empty name table so root entry points at offset 0
+        filename_table = bytearray()
 
         # Build simple directory tree from mapping.
         flags = flags or {}
+        block_flags = block_flags or {}
         root: dict[str, object] = {}
         for path, data in files.items():
             parts = [p for p in path.replace("\\", "/").split("/") if p]
@@ -311,10 +427,13 @@ class CacheFile:
             node[parts[-1]] = data
 
         file_nodes: list[tuple[int, bytes]] = []
+        checksum_entries: list[tuple[int, int]] = []  # (count, start_index)
         checksums: list[int] = []
+        index_to_path: dict[int, str] = {}
 
         def add_entry(obj: object, name: str, parent: int, path: str) -> int:
             index = len(manifest.manifest_entries)
+            index_to_path[index] = path
             entry = CacheFileManifestEntry(manifest)
             entry.index = index
             entry.name_offset = len(filename_table)
@@ -325,14 +444,16 @@ class CacheFile:
             if isinstance(obj, dict):
                 # Directory
                 entry.item_size = 0
-                entry.checksum_index = 0
-                entry.directory_flags = flags.get(path, 0)
+                entry.checksum_index = 0xFFFFFFFF  # Directories have no checksum
+                # Directory entries do not carry flag bits in GCF manifests
+                entry.directory_flags = 0
                 manifest.manifest_entries.append(entry)
                 manifest.manifest_map_entries.append(0xFFFFFFFF)
                 children: list[int] = []
                 for child_name in sorted(obj):
                     child_path = path + "/" + child_name if path else child_name
                     children.append(add_entry(obj[child_name], child_name, index, child_path))
+                entry.item_size = len(children)  # Directory size = child count
                 if children:
                     entry.child_index = children[0]
                     for a, b in zip(children, children[1:]):
@@ -341,12 +462,35 @@ class CacheFile:
                 # File
                 data = obj  # type: ignore[assignment]
                 entry.item_size = len(data)
-                entry.checksum_index = len(checksums)
-                entry.directory_flags = flags.get(path, 0) | CacheFileManifestEntry.FLAG_IS_FILE
+                entry.checksum_index = len(checksum_entries)
+                entry.directory_flags = (
+                    flags.get(path, 0) | CacheFileManifestEntry.FLAG_IS_FILE
+                )
                 manifest.manifest_entries.append(entry)
                 manifest.manifest_map_entries.append(0)
+
+                # Track special file types
+                if entry.directory_flags & CacheFileManifestEntry.FLAG_IS_USER_CONFIG:
+                    manifest.user_config_entries.append(index)
+                if entry.directory_flags & CacheFileManifestEntry.FLAG_IS_PURGE_FILE:
+                    manifest.minimum_footprint_entries.append(index)
+
                 file_nodes.append((index, data))
-                checksums.append(zlib.crc32(data) & 0xFFFFFFFF)
+
+                # Generate per-block checksums (v6 uses Adler32 ^ CRC32)
+                start = len(checksums)
+                chunk_count = 0
+                for offset in range(0, len(data), CACHE_CHECKSUM_LENGTH):
+                    chunk = data[offset : offset + CACHE_CHECKSUM_LENGTH]
+                    chk = (adler32(chunk, 0) ^ zlib.crc32(chunk, 0)) & 0xFFFFFFFF
+                    checksums.append(chk)
+                    chunk_count += 1
+                if chunk_count == 0:
+                    # Empty file still gets one checksum
+                    chk = (adler32(b"", 0) ^ zlib.crc32(b"", 0)) & 0xFFFFFFFF
+                    checksums.append(chk)
+                    chunk_count = 1
+                checksum_entries.append((chunk_count, start))
             return index
 
         add_entry(root, "", 0xFFFFFFFF, "")
@@ -354,24 +498,56 @@ class CacheFile:
         manifest.filename_table = bytes(filename_table)
         manifest.node_count = len(manifest.manifest_entries)
         manifest.file_count = len(file_nodes)
-        manifest.hash_table_indices = list(range(manifest.node_count))
+
+        # Build manifest hash table used for name lookups
+        bucket_count = 1 << ((manifest.node_count * 2 - 1).bit_length())
+        buckets: list[list[int]] = [[] for _ in range(bucket_count)]
+        for entry in manifest.manifest_entries:
+            off = entry.name_offset
+            end = manifest.filename_table.index(b"\0", off)
+            name = manifest.filename_table[off:end].lower()
+            h = _bobhash(name)
+            buckets[h & (bucket_count - 1)].append(entry.index)
+
+        hash_table_keys = [0xFFFFFFFF] * bucket_count
+        hash_table_indices: list[int] = []
+        for i, bucket in enumerate(buckets):
+            if not bucket:
+                continue
+            hash_table_keys[i] = bucket_count + len(hash_table_indices)
+            for j, idx in enumerate(bucket):
+                val = idx | (0x80000000 if j == len(bucket) - 1 else 0)
+                hash_table_indices.append(val)
+
+        manifest.hash_table_keys = hash_table_keys
+        manifest.hash_table_indices = hash_table_indices
         manifest.owner = self
         self.manifest = manifest
 
         # ------------------------------------------------------------------
         # Checksum map
         # ------------------------------------------------------------------
-        if checksums:
+        if checksum_entries:
             checksum_map = CacheFileChecksumMap(self)
             checksum_map.header_version = 1
-            checksum_map.checksum_size = 4
-            checksum_map.format_code = 1
+            checksum_map.checksum_size = 0  # Placeholder, recomputed below
+            # External validators expect a magic value in the "format" field
+            checksum_map.format_code = 0x14893721
             checksum_map.version = 1
-            checksum_map.entries = [(1, i) for i in range(len(checksums))]
+            checksum_map.entries = checksum_entries
             checksum_map.checksums = checksums
-            checksum_map.file_id_count = len(checksums)
+            checksum_map.file_id_count = len(checksum_entries)
             checksum_map.checksum_count = len(checksums)
-            checksum_map.signature = b"\0" * 128
+            checksum_map.latest_application_version = app_version
+            checksum_map.signature = b""  # Will be computed during serialization
+            # Checksum size: header (24) + entries + checksums + signature (128) + footer (4)
+            checksum_map.checksum_size = (
+                24
+                + checksum_map.file_id_count * 8
+                + checksum_map.checksum_count * 4
+                + 128
+                + 4
+            )
             self.checksum_map = checksum_map
         else:
             self.checksum_map = None
@@ -392,7 +568,11 @@ class CacheFile:
                 chunk = data[chunk_start:chunk_start + sector_size]
                 block = CacheFileBlockAllocationTableEntry(blocks)
                 block.index = total_blocks
-                block.entry_flags = CacheFileBlockAllocationTableEntry.FLAG_DATA
+                # Get block-specific flags from block_flags or use default v6 flags
+                path = index_to_path[file_index]
+                bf = block_flags.get(path, 0) if block_flags else 0
+                block.entry_flags = CacheFileBlockAllocationTableEntry.FLAG_DATA | bf
+                block.dummy0 = CacheFileBlockAllocationTableEntry.DUMMY0
                 block.file_data_offset = total_blocks * sector_size
                 block.file_data_size = len(chunk)
                 block._first_sector_index = total_blocks
@@ -401,21 +581,35 @@ class CacheFile:
                     prev_block if prev_block is not None else 0xFFFFFFFF
                 )
                 block.manifest_index = file_index
+                blocks.blocks.append(block)
+                alloc.entries.append(total_blocks + 1)
+                self.stream.write(chunk.ljust(sector_size, b"\0"))
                 if prev_block is not None:
                     blocks.blocks[prev_block]._next_block_index = block.index
-                blocks.blocks.append(block)
-                alloc.entries.append(0xFFFFFFFF)
-                self.stream.write(chunk.ljust(sector_size, b"\0"))
-                if prev_block is None:
+                    alloc.entries[prev_block] = block.index
+                else:
                     manifest.manifest_map_entries[file_index] = block.index
                 prev_block = block.index
                 total_blocks += 1
+            if prev_block is not None:
+                alloc.entries[prev_block] = alloc.terminator
 
         blocks.block_count = total_blocks
         blocks.blocks_used = total_blocks
         blocks.last_block_used = total_blocks - 1 if total_blocks else 0
         blocks.dummy1 = blocks.dummy2 = blocks.dummy3 = blocks.dummy4 = 0
         self.blocks = blocks
+
+        # v6 doesn't use block entry map, but we create it for conversion compatibility
+        bemap = CacheFileBlockEntryMap(self)
+        bemap.entries = list(range(total_blocks))
+        self.block_entry_map = bemap
+
+        # Adjust manifest map entries: v6 uses direct block indices, but for
+        # directories and unmapped files we use block_count as sentinel
+        for i, idx in enumerate(manifest.manifest_map_entries):
+            if idx == 0xFFFFFFFF:
+                manifest.manifest_map_entries[i] = total_blocks
 
         alloc.sector_count = total_blocks
         alloc.first_unused_entry = total_blocks
@@ -478,7 +672,11 @@ class CacheFile:
         # Temporary owner that mirrors the structure expected by the various
         # serialisation routines.
         owner = SimpleNamespace(
-            header=header, block_entry_map=block_entry_map, blocks=blocks
+            header=header,
+            block_entry_map=block_entry_map,
+            blocks=blocks,
+            alloc_table=alloc_table,
+            checksum_map=checksum_map,
         )
         manifest.owner = owner
         if block_entry_map:
@@ -488,9 +686,11 @@ class CacheFile:
             checksum_map.owner = owner
 
         header.format_version = target_version
+        header.dummy1 = 0
         data_header.format_version = target_version
         blocks.owner = owner
         alloc_table.owner = owner
+        blocks.dummy1 = blocks.dummy2 = blocks.dummy3 = blocks.dummy4 = 0
 
         original_map_entries = list(manifest.manifest_map_entries)
 
@@ -498,9 +698,11 @@ class CacheFile:
             if block_entry_map is None:
                 block_entry_map = CacheFileBlockEntryMap(owner)
                 block_entry_map.entries = list(range(blocks.block_count))
-                owner.block_entry_map = block_entry_map
+            owner.block_entry_map = block_entry_map
             inverse = {blk: idx for idx, blk in enumerate(block_entry_map.entries)}
-            manifest.manifest_map_entries = [inverse.get(i, i) for i in original_map_entries]
+            manifest.manifest_map_entries = [
+                inverse.get(i, i) for i in original_map_entries
+            ]
         else:
             if block_entry_map is not None:
                 mapped: list[int] = []
@@ -513,51 +715,129 @@ class CacheFile:
             block_entry_map = None
             owner.block_entry_map = None
 
-        # The v1 generator follows a slightly different manifest layout.
-        # Reuse the dedicated helper so our output mirrors the legacy tool.
-        if target_version == 1:
-            prepare_manifest_for_v1(manifest)
+        # Normalize manifest map sentinels
+        for i, idx in enumerate(manifest.manifest_map_entries):
+            if idx == 0xFFFFFFFF:
+                manifest.manifest_map_entries[i] = blocks.block_count
+
+        # Adjust manifest header version based on target GCF version
+        # v1, v3, v5: manifest header version 3
+        # v6: manifest header version 4
+        if target_version < 6:
+            manifest.header_version = 3
+            # v1 requires special handling for hash tables and footprint
+            if target_version == 1:
+                prepare_manifest_for_v1(manifest)
+            else:
+                # v3 and v5 use the standard hash table
+                manifest.compression_block_size = CACHE_CHECKSUM_LENGTH
+                manifest.depot_info = 2
+        else:
+            manifest.header_version = 4
+            manifest.compression_block_size = CACHE_CHECKSUM_LENGTH
 
         # Generate a checksum map when targeting newer formats.
+        # Note: We always regenerate checksums when the format changes between
+        # v6 (per-block Adler32^CRC32) and v3/v5 (per-file CRC32)
         if target_version > 1:
-            if checksum_map is None:
+            # Determine if we need to regenerate checksums
+            need_regen = checksum_map is None
+            if checksum_map is not None:
+                # Check if checksum format is changing
+                src_is_v6 = checksum_map.format_code == 0x14893721
+                dst_is_v6 = target_version >= 6
+                if src_is_v6 != dst_is_v6:
+                    need_regen = True
+                    checksum_map = None  # Force regeneration
+
+            if need_regen or checksum_map is None:
+
                 checksum_map = CacheFileChecksumMap(owner)
                 checksum_map.header_version = 1
-                checksum_map.checksum_size = 4
-                checksum_map.format_code = 1
+                # v6 uses magic format code, v3/v5 use simple format
+                checksum_map.format_code = 0x14893721 if target_version >= 6 else 1
                 checksum_map.version = 1
                 checksum_map.entries = []
                 checksum_map.checksums = []
-                checksum_map.signature = b"\0" * 128
+                # Only v6 uses RSA signatures
+                checksum_map.signature = b"" if target_version >= 6 else b"\0" * 128
+                checksum_map.latest_application_version = header.application_version
+
                 for entry in self.manifest.manifest_entries:
                     if not (
                         entry.directory_flags & CacheFileManifestEntry.FLAG_IS_FILE
                     ):
                         continue
-                    crc = 0
-                    remaining = entry.item_size
-                    block = entry.first_block
-                    while block is not None and remaining > 0:
-                        for sector in block.sectors:
-                            if remaining <= 0:
-                                break
-                            self.stream.seek(
-                                self.data_header.first_sector_offset
-                                + sector.index * self.header.sector_size
-                            )
-                            chunk = self.stream.read(
-                                min(remaining, self.header.sector_size)
-                            )
-                            crc = zlib.crc32(chunk, crc)
-                            remaining -= len(chunk)
-                            if remaining <= 0:
-                                break
-                        block = block.next_block
-                    checksum_map.entries.append((1, len(checksum_map.checksums)))
-                    checksum_map.checksums.append(crc & 0xFFFFFFFF)
+
+                    # v6 uses per-block checksums (Adler32 ^ CRC32)
+                    # Earlier versions use simple per-file CRC32
+                    if target_version >= 6:
+                        start_idx = len(checksum_map.checksums)
+                        remaining = entry.item_size
+                        block = entry.first_block
+                        while block is not None and remaining > 0:
+                            for sector in block.sectors:
+                                if remaining <= 0:
+                                    break
+                                self.stream.seek(
+                                    self.data_header.first_sector_offset
+                                    + sector.index * self.header.sector_size
+                                )
+                                chunk = self.stream.read(
+                                    min(remaining, CACHE_CHECKSUM_LENGTH)
+                                )
+                                chk = (adler32(chunk, 0) ^ zlib.crc32(chunk, 0)) & 0xFFFFFFFF
+                                checksum_map.checksums.append(chk)
+                                remaining -= len(chunk)
+                                if remaining <= 0:
+                                    break
+                            block = block.next_block
+                        chunk_count = len(checksum_map.checksums) - start_idx
+                        if chunk_count == 0:
+                            chk = (adler32(b"", 0) ^ zlib.crc32(b"", 0)) & 0xFFFFFFFF
+                            checksum_map.checksums.append(chk)
+                            chunk_count = 1
+                        checksum_map.entries.append((chunk_count, start_idx))
+                    else:
+                        # v1/v3/v5 use simple per-file CRC32
+                        crc = 0
+                        remaining = entry.item_size
+                        block = entry.first_block
+                        while block is not None and remaining > 0:
+                            for sector in block.sectors:
+                                if remaining <= 0:
+                                    break
+                                self.stream.seek(
+                                    self.data_header.first_sector_offset
+                                    + sector.index * self.header.sector_size
+                                )
+                                chunk = self.stream.read(
+                                    min(remaining, self.header.sector_size)
+                                )
+                                crc = zlib.crc32(chunk, crc)
+                                remaining -= len(chunk)
+                                if remaining <= 0:
+                                    break
+                            block = block.next_block
+                        checksum_map.entries.append((1, len(checksum_map.checksums)))
+                        checksum_map.checksums.append(crc & 0xFFFFFFFF)
+
                 checksum_map.file_id_count = len(checksum_map.entries)
                 checksum_map.checksum_count = len(checksum_map.checksums)
+                # Checksum size includes the entire checksum map section
+                # Header (24) + Entries (file_id_count * 8) + Checksums (checksum_count * 4) + Signature (128) [+ Footer (4) for v6]
+                if target_version >= 6:
+                    checksum_map.checksum_size = (
+                        24 + checksum_map.file_id_count * 8 +
+                        checksum_map.checksum_count * 4 + 128 + 4
+                    )
+                else:
+                    checksum_map.checksum_size = (
+                        24 + checksum_map.file_id_count * 8 +
+                        checksum_map.checksum_count * 4 + 128
+                    )
             checksum_map.owner = owner
+            owner.checksum_map = checksum_map
         else:
             checksum_map = None
             owner.checksum_map = None
@@ -568,6 +848,7 @@ class CacheFile:
         data_header.sector_count = blocks.block_count
         header.sector_size = self.header.sector_size
         data_header.sector_size = self.header.sector_size
+
 
         blocks_bytes = blocks.serialize()
         alloc_bytes = alloc_table.serialize()
@@ -584,14 +865,15 @@ class CacheFile:
         )
 
         header_size = 44
-        data_header.first_sector_offset = (
+        checksum_offset = (
             header_size
             + len(blocks_bytes)
             + len(alloc_bytes)
             + len(block_entry_bytes)
             + len(manifest_bytes)
-            + len(checksum_bytes)
         )
+
+        data_header.first_sector_offset = checksum_offset + len(checksum_bytes)
         data_header_bytes = data_header.serialize()
         # The offset stored in the data header points to the first data sector,
         # not the start of the header itself.  Account for the header size and
@@ -1026,11 +1308,19 @@ class CacheFile:
         dest_folder.items[name] = entry
 
     def save(self, output_path: str, progress: Callable[[int, int], None] | None = None) -> None:
+        """Save the modified GCF to a file, rebuilding all tables.
+
+        This method completely rebuilds the GCF from the current directory tree,
+        regenerating all tables (blocks, allocation, manifest, checksums) to
+        account for any modifications made via add_file, remove_file, move_file.
+        """
         files: dict[str, bytes] = {}
         flags: dict[str, int] = {}
+        block_flags: dict[str, int] = {}
 
         def collect(folder: DirectoryFolder):
-            flags[folder.path().lstrip(STEAM_TERMINATOR).replace(STEAM_TERMINATOR, "/")] = getattr(folder, "flags", 0)
+            folder_path = folder.path().lstrip(STEAM_TERMINATOR).replace(STEAM_TERMINATOR, "/")
+            flags[folder_path] = getattr(folder, "flags", 0)
             for entry in folder.items.values():
                 if entry.is_folder():
                     collect(entry)
@@ -1046,14 +1336,21 @@ class CacheFile:
                     key = entry.path().lstrip(STEAM_TERMINATOR).replace(STEAM_TERMINATOR, "/")
                     files[key] = data
                     flags[key] = getattr(entry, "flags", 0)
+                    # Preserve block-level flags if available
+                    block_flags[key] = getattr(entry, "block_flags", 0)
 
         collect(self.root)
+
+        # Get manifest-level flags from the current manifest if available
+        manifest_flags = self.manifest.depot_info if self.manifest else 0
 
         cf = CacheFile.build(
             files,
             app_id=self.header.application_id,
             app_version=self.header.application_version,
             flags=flags,
+            block_flags=block_flags,
+            manifest_flags=manifest_flags,
         )
         cf.convert_version(self.header.format_version, output_path, progress=progress)
 
@@ -1278,7 +1575,7 @@ class CacheFileHeader:
     def serialize(self):
         data = struct.pack("<10L", self.header_version, self.cache_type, self.format_version, self.application_id,
                            self.application_version, self.is_mounted, self.dummy1, self.file_size, self.sector_size, self.sector_count)
-        self.checksum = sum(data)
+        self.checksum = sum(data) & 0xFFFFFFFF
         return data + struct.pack("<L", self.checksum)
 
     def calculate_checksum(self):
@@ -1356,24 +1653,64 @@ class CacheFileBlockAllocationTable:
 
 class CacheFileBlockAllocationTableEntry:
 
-    FLAG_DATA    = 0x200F8000
-    FLAG_DATA_2  = 0x200FC000
-    FLAG_NO_DATA = 0x200F0000
+    # v6 format constants (16-bit flags)
+    DUMMY0 = 0x200F
+    FLAG_DATA = 0x8000
+    FLAG_DATA_2 = 0xC000
+    FLAG_NO_DATA = 0x0000
+    FLAG_ENCRYPTED = 0x0004
+    FLAG_COMPRESSED_ENCRYPTED = 0x0002
+    FLAG_RAW = 0x0001
+    FLAG_LOCAL_PRIORITY = 0x4000
+
+    # Legacy format constants (32-bit flags) for v1/v3/v5
+    FLAG_DATA_LEGACY = 0x200F8000
+    FLAG_DATA_2_LEGACY = 0x200FC000
+    FLAG_NO_DATA_LEGACY = 0x200F0000
 
     def __init__(self, owner):
         self.owner = owner
+        self.dummy0 = self.DUMMY0  # Default value for v6
 
     def parse(self, stream):
-        # Block Entry
-        (
-            self.entry_flags,
-            self.file_data_offset,
-            self.file_data_size,
-            self._first_sector_index,
-            self._next_block_index,
-            self._prev_block_index,
-            self.manifest_index,
-        ) = struct.unpack("<7L", stream.read(28))
+        """Parse a block entry from stream.
+
+        The block entry format changed between GCF versions:
+        - v1, v3, v5: 7 DWORDs (entry_flags is 32-bit)
+        - v6: 2 uint16 + 6 DWORDs (entry_flags and dummy0 are each 16-bit)
+
+        Both formats are 28 bytes total, but the field layout differs.
+        """
+        fmt_version = self.owner.owner.header.format_version
+        data = stream.read(28)
+
+        if fmt_version >= 6:
+            # v6 format: uint16 flags, uint16 dummy, 6 DWORDs
+            (
+                self.entry_flags,
+                self.dummy0,
+                self.file_data_offset,
+                self.file_data_size,
+                self._first_sector_index,
+                self._next_block_index,
+                self._prev_block_index,
+                self.manifest_index,
+            ) = struct.unpack("<2H6L", data)
+        else:
+            # Legacy format (v1/v3/v5): 7 DWORDs
+            (
+                flags_combined,
+                self.file_data_offset,
+                self.file_data_size,
+                self._first_sector_index,
+                self._next_block_index,
+                self._prev_block_index,
+                self.manifest_index,
+            ) = struct.unpack("<7L", data)
+            # Split the combined 32-bit flags into 16-bit parts
+            self.entry_flags = flags_combined & 0xFFFF
+            self.dummy0 = (flags_combined >> 16) & 0xFFFF
+
         # Maintain backwards compatibility with callers expecting ``flags``.
         self.flags = self.entry_flags
 
@@ -1436,16 +1773,38 @@ class CacheFileBlockAllocationTableEntry:
     is_fragmented = property(_get_is_fragmented)
 
     def serialize(self):
-        return struct.pack(
-            "<7L",
-            self.entry_flags,
-            self.file_data_offset,
-            self.file_data_size,
-            self._first_sector_index,
-            self._next_block_index,
-            self._prev_block_index,
-            self.manifest_index,
-        )
+        """Serialize block entry based on the owner's GCF version.
+
+        v6 uses 16-bit flags + 16-bit dummy, earlier versions use 32-bit combined.
+        """
+        fmt_version = self.owner.owner.header.format_version
+
+        if fmt_version >= 6:
+            # v6 format: uint16 flags, uint16 dummy, 6 DWORDs
+            return struct.pack(
+                "<2H6L",
+                self.entry_flags & 0xFFFF,
+                self.dummy0 & 0xFFFF,
+                self.file_data_offset,
+                self.file_data_size,
+                self._first_sector_index,
+                self._next_block_index,
+                self._prev_block_index,
+                self.manifest_index,
+            )
+        else:
+            # Legacy format (v1/v3/v5): 7 DWORDs with combined flags
+            flags_combined = (self.entry_flags & 0xFFFF) | ((self.dummy0 & 0xFFFF) << 16)
+            return struct.pack(
+                "<7L",
+                flags_combined,
+                self.file_data_offset,
+                self.file_data_size,
+                self._first_sector_index,
+                self._next_block_index,
+                self._prev_block_index,
+                self.manifest_index,
+            )
 
 class CacheFileAllocationTable:
 
@@ -1676,6 +2035,10 @@ class CacheFileManifest:
         self.num_of_user_config_files = len(self.user_config_entries)
         self.num_of_minimum_footprint_files = len(self.minimum_footprint_entries)
         self.name_size = len(self.filename_table)
+
+        # Calculate binary_size: header + entries + name table + hash tables + footprint/config lists
+        # Note: map_header (map_header_version, map_dummy1) is written AFTER binary_size bytes
+        # and manifest_map_entries is also written after binary_size bytes
         self.binary_size = 56 + 32 * self.node_count + self.name_size + 4 * (
             self.hash_table_key_count
             + self.num_of_user_config_files
@@ -1827,6 +2190,7 @@ class CacheFileChecksumMap:
         self.checksums = []
 
     def parse(self, stream):
+        pos = stream.tell()
 
         (self.header_version,
          self.checksum_size,
@@ -1835,6 +2199,7 @@ class CacheFileChecksumMap:
          self.file_id_count,
          self.checksum_count) = struct.unpack("<6L", stream.read(24))
 
+
         for i in range(self.file_id_count):
             self.entries.append(struct.unpack("<2L", stream.read(8)))
 
@@ -1842,12 +2207,65 @@ class CacheFileChecksumMap:
 
         self.signature = stream.read(128)
 
+        # Read latest application version footer (only present in v6 with format_code 0x14893721)
+        if self.format_code == 0x14893721:
+            try:
+                self.latest_application_version = struct.unpack("<L", stream.read(4))[0]
+            except Exception:
+                self.latest_application_version = self.owner.header.application_version
+        else:
+            # v3/v5 don't have this footer
+            self.latest_application_version = self.owner.header.application_version
+
     def serialize(self):
-        data = [struct.pack("<6L", self.header_version, self.checksum_size, self.format_code, self.version, self.file_id_count, self.checksum_count)]
+        """Serialize checksum map with optional RSA signature and footer.
+
+        v6: Includes RSA signature + latest_application_version footer
+        v3/v5: Includes 128-byte null signature, no footer
+        v1: No checksum map at all
+        """
+
+        # Build checksum data without signature
+        data = [
+            struct.pack("<6L", self.header_version, self.checksum_size,
+                       self.format_code, self.version, self.file_id_count,
+                       self.checksum_count)
+        ]
         data += [struct.pack("<2L", *i) for i in self.entries]
         data.append(pack_dword_list(self.checksums))
-        data.append(self.signature)
+
+        # Generate RSA signature only for v6 (format_code 0x14893721)
+        if self.format_code == 0x14893721:
+            if not self.signature:
+                checksum_data = b"".join(data)
+                self.signature = _rsa_pkcs1_sha1_sign(checksum_data)
+            data.append(self.signature)
+            # v6 includes the latest_application_version footer
+            data.append(struct.pack("<L", self.latest_application_version))
+        else:
+            # v3/v5 use null signature, no footer
+            if not self.signature or len(self.signature) != 128:
+                self.signature = b"\0" * 128
+            data.append(self.signature)
+
         return b"".join(data)
+
+    def verify_signature(self) -> bool:
+        """Verify the RSA signature on the checksum data."""
+        if not self.signature or len(self.signature) != 128:
+            return False
+
+        # Build checksum data without signature
+        data = [
+            struct.pack("<6L", self.header_version, self.checksum_size,
+                       self.format_code, self.version, self.file_id_count,
+                       self.checksum_count)
+        ]
+        data += [struct.pack("<2L", *i) for i in self.entries]
+        data.append(pack_dword_list(self.checksums))
+        checksum_data = b"".join(data)
+
+        return _rsa_pkcs1_sha1_verify(checksum_data, self.signature)
 
     def validate(self):
         pass
@@ -1882,6 +2300,7 @@ class CacheFileSectorHeader:
                 self.sectors_used,
                 self.checksum,
             ) = struct.unpack("<6L", data)
+
 
     def serialize(self):
         self.checksum = self.calculate_checksum()
