@@ -2340,8 +2340,8 @@ class CacheFileSectorHeader:
                 self.sectors_used,
                 self.checksum,
             )
-        elif self.format_version in (5, 6):
-            # v5 and v6 write AppVersionId separately before the data header
+        elif self.format_version == 5:
+            # v5 writes AppVersionId separately before the data header
             app_version_bytes = struct.pack("<I", self.application_version)
             data_bytes = struct.pack(
                 "<5L",
@@ -2352,6 +2352,17 @@ class CacheFileSectorHeader:
                 self.checksum,
             )
             return app_version_bytes + data_bytes
+        elif self.format_version == 6:
+            # v6 stores AppVersionId in checksum map footer, not here
+            # Data header is just 5 longs
+            return struct.pack(
+                "<5L",
+                self.sector_count,
+                self.sector_size,
+                self.first_sector_offset,
+                self.sectors_used,
+                self.checksum,
+            )
         return struct.pack(
             "<6L",
             self.application_version,
