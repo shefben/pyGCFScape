@@ -260,7 +260,20 @@ class CacheFile:
         if self.is_gcf():
             # Data Header.
             self.data_header = CacheFileSectorHeader(self)
-            header_size = 24 if self.header.format_version > 3 else 20
+            # v5 and v6 have AppVersionId as a separate field before the data header
+            if self.header.format_version in (5, 6):
+                # For v6, the AppVersionId was already read by the checksum map as latest_application_version
+                # For v5, we need to read it here
+                if self.header.format_version == 6:
+                    # Use the latest_application_version from checksum map
+                    self.data_header.application_version_v56 = self.checksum_map.latest_application_version
+                else:
+                    # v5: read AppVersionId2 here
+                    app_version_data = stream.read(4)
+                    self.data_header.application_version_v56 = struct.unpack("<I", app_version_data)[0]
+                header_size = 20  # 5 longs for v5/v6
+            else:
+                header_size = 24 if self.header.format_version > 3 else 20
             pos = stream.tell()
             self.data_header.parse(stream.read(header_size), self.header.format_version)
             self.data_header.validate()
@@ -2291,6 +2304,20 @@ class CacheFileSectorHeader:
             ) = struct.unpack("<5L", data)
             # Older GCF versions omit the application version field.
             self.application_version = self.owner.header.application_version
+        elif format_version in (5, 6):
+            # v5 and v6 have AppVersionId stored separately before the data header
+            (
+                self.sector_count,
+                self.sector_size,
+                self.first_sector_offset,
+                self.sectors_used,
+                self.checksum,
+            ) = struct.unpack("<5L", data)
+            # Use the separately stored application_version_v56
+            if hasattr(self, 'application_version_v56'):
+                self.application_version = self.application_version_v56
+            else:
+                self.application_version = self.owner.header.application_version
         else:
             (
                 self.application_version,
@@ -2313,6 +2340,29 @@ class CacheFileSectorHeader:
                 self.sectors_used,
                 self.checksum,
             )
+        elif self.format_version == 5:
+            # v5 writes AppVersionId separately before the data header
+            app_version_bytes = struct.pack("<I", self.application_version)
+            data_bytes = struct.pack(
+                "<5L",
+                self.sector_count,
+                self.sector_size,
+                self.first_sector_offset,
+                self.sectors_used,
+                self.checksum,
+            )
+            return app_version_bytes + data_bytes
+        elif self.format_version == 6:
+            # v6 stores AppVersionId in checksum map footer, not here
+            # Data header is just 5 longs
+            return struct.pack(
+                "<5L",
+                self.sector_count,
+                self.sector_size,
+                self.first_sector_offset,
+                self.sectors_used,
+                self.checksum,
+            )
         return struct.pack(
             "<6L",
             self.application_version,
@@ -2324,8 +2374,10 @@ class CacheFileSectorHeader:
         )
 
     def validate(self):
+        # v5 and v6 store AppVersionId separately and should always match
+        # v4 stores it in the data header and should be validated
         if (
-            self.format_version > 3
+            self.format_version == 4
             and self.application_version != self.owner.header.application_version
         ):
             raise ValueError(
