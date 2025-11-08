@@ -286,6 +286,59 @@ class CacheFile:
                 self.stream = None
 
     @classmethod
+    def build_version(
+        cls,
+        files: dict[str, bytes],
+        target_version: int,
+        out_path: str,
+        app_id: int = 0,
+        app_version: int = 0,
+        flags: dict[str, int] | None = None,
+        block_flags: dict[str, int] | None = None,
+        manifest_flags: int = 0,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> None:
+        """Build and save a GCF file directly at the specified version.
+
+        This is a convenience method that combines build() and convert_version()
+        into a single operation for creating GCF files from scratch.
+
+        Parameters
+        ----------
+        files : dict[str, bytes]
+            Mapping of file paths to file contents
+        target_version : int
+            Target GCF format version (1, 3, 5, or 6)
+        out_path : str
+            Destination path for the GCF file
+        app_id : int
+            Steam application ID
+        app_version : int
+            Application version
+        flags : dict[str, int] | None
+            Mapping of file paths to manifest entry flags
+        block_flags : dict[str, int] | None
+            Mapping of file paths to block entry flags
+        manifest_flags : int
+            Manifest bitmask flags
+        progress : Callable[[int, int], None] | None
+            Optional progress callback
+        """
+        if target_version not in (1, 3, 5, 6):
+            raise ValueError(f"Unsupported GCF version: {target_version}")
+
+        cf = cls.build(
+            files,
+            app_id=app_id,
+            app_version=app_version,
+            flags=flags,
+            block_flags=block_flags,
+            manifest_flags=manifest_flags,
+        )
+        cf.convert_version(target_version, out_path, progress=progress)
+        cf.close()
+
+    @classmethod
     def build(
         cls,
         files: dict[str, bytes],
@@ -486,11 +539,13 @@ class CacheFile:
             checksum_map.checksum_count = len(checksums)
             checksum_map.latest_application_version = app_version
             checksum_map.signature = b""  # Will be computed during serialization
+            # Checksum size: header (24) + entries + checksums + signature (128) + footer (4)
             checksum_map.checksum_size = (
-                16
+                24
                 + checksum_map.file_id_count * 8
                 + checksum_map.checksum_count * 4
                 + 128
+                + 4
             )
             self.checksum_map = checksum_map
         else:
@@ -620,6 +675,7 @@ class CacheFile:
             block_entry_map=block_entry_map,
             blocks=blocks,
             alloc_table=alloc_table,
+            checksum_map=checksum_map,
         )
         manifest.owner = owner
         if block_entry_map:
@@ -663,21 +719,46 @@ class CacheFile:
             if idx == 0xFFFFFFFF:
                 manifest.manifest_map_entries[i] = blocks.block_count
 
-        # The v1 generator follows a slightly different manifest layout.
-        # Reuse the dedicated helper so our output mirrors the legacy tool.
-        if target_version == 1:
-            prepare_manifest_for_v1(manifest)
+        # Adjust manifest header version based on target GCF version
+        # v1, v3, v5: manifest header version 3
+        # v6: manifest header version 4
+        if target_version < 6:
+            manifest.header_version = 3
+            # v1 requires special handling for hash tables and footprint
+            if target_version == 1:
+                prepare_manifest_for_v1(manifest)
+            else:
+                # v3 and v5 use the standard hash table
+                manifest.compression_block_size = CACHE_CHECKSUM_LENGTH
+                manifest.depot_info = 2
+        else:
+            manifest.header_version = 4
+            manifest.compression_block_size = CACHE_CHECKSUM_LENGTH
 
         # Generate a checksum map when targeting newer formats.
+        # Note: We always regenerate checksums when the format changes between
+        # v6 (per-block Adler32^CRC32) and v3/v5 (per-file CRC32)
         if target_version > 1:
-            if checksum_map is None:
+            # Determine if we need to regenerate checksums
+            need_regen = checksum_map is None
+            if checksum_map is not None:
+                # Check if checksum format is changing
+                src_is_v6 = checksum_map.format_code == 0x14893721
+                dst_is_v6 = target_version >= 6
+                if src_is_v6 != dst_is_v6:
+                    need_regen = True
+                    checksum_map = None  # Force regeneration
+
+            if need_regen or checksum_map is None:
                 checksum_map = CacheFileChecksumMap(owner)
                 checksum_map.header_version = 1
+                # v6 uses magic format code, v3/v5 use simple format
                 checksum_map.format_code = 0x14893721 if target_version >= 6 else 1
                 checksum_map.version = 1
                 checksum_map.entries = []
                 checksum_map.checksums = []
-                checksum_map.signature = b""  # Will be generated during serialization
+                # Only v6 uses RSA signatures
+                checksum_map.signature = b"" if target_version >= 6 else b"\0" * 128
                 checksum_map.latest_application_version = header.application_version
 
                 for entry in self.manifest.manifest_entries:
@@ -741,12 +822,23 @@ class CacheFile:
 
                 checksum_map.file_id_count = len(checksum_map.entries)
                 checksum_map.checksum_count = len(checksum_map.checksums)
-                checksum_map.checksum_size = (
-                    16 + checksum_map.file_id_count * 8 + checksum_map.checksum_count * 4 + 128
-                )
+                # Checksum size includes the entire checksum map section
+                # Header (24) + Entries (file_id_count * 8) + Checksums (checksum_count * 4) + Signature (128) [+ Footer (4) for v6]
+                if target_version >= 6:
+                    checksum_map.checksum_size = (
+                        24 + checksum_map.file_id_count * 8 +
+                        checksum_map.checksum_count * 4 + 128 + 4
+                    )
+                else:
+                    checksum_map.checksum_size = (
+                        24 + checksum_map.file_id_count * 8 +
+                        checksum_map.checksum_count * 4 + 128
+                    )
             checksum_map.owner = owner
+            owner.checksum_map = checksum_map
         else:
             checksum_map = None
+            owner.checksum_map = None
 
         # Recalculate offsets and sizes.
         header.sector_count = blocks.block_count
@@ -1212,11 +1304,19 @@ class CacheFile:
         dest_folder.items[name] = entry
 
     def save(self, output_path: str, progress: Callable[[int, int], None] | None = None) -> None:
+        """Save the modified GCF to a file, rebuilding all tables.
+
+        This method completely rebuilds the GCF from the current directory tree,
+        regenerating all tables (blocks, allocation, manifest, checksums) to
+        account for any modifications made via add_file, remove_file, move_file.
+        """
         files: dict[str, bytes] = {}
         flags: dict[str, int] = {}
+        block_flags: dict[str, int] = {}
 
         def collect(folder: DirectoryFolder):
-            flags[folder.path().lstrip(STEAM_TERMINATOR).replace(STEAM_TERMINATOR, "/")] = getattr(folder, "flags", 0)
+            folder_path = folder.path().lstrip(STEAM_TERMINATOR).replace(STEAM_TERMINATOR, "/")
+            flags[folder_path] = getattr(folder, "flags", 0)
             for entry in folder.items.values():
                 if entry.is_folder():
                     collect(entry)
@@ -1232,14 +1332,21 @@ class CacheFile:
                     key = entry.path().lstrip(STEAM_TERMINATOR).replace(STEAM_TERMINATOR, "/")
                     files[key] = data
                     flags[key] = getattr(entry, "flags", 0)
+                    # Preserve block-level flags if available
+                    block_flags[key] = getattr(entry, "block_flags", 0)
 
         collect(self.root)
+
+        # Get manifest-level flags from the current manifest if available
+        manifest_flags = self.manifest.depot_info if self.manifest else 0
 
         cf = CacheFile.build(
             files,
             app_id=self.header.application_id,
             app_version=self.header.application_version,
             flags=flags,
+            block_flags=block_flags,
+            manifest_flags=manifest_flags,
         )
         cf.convert_version(self.header.format_version, output_path, progress=progress)
 
@@ -2098,7 +2205,12 @@ class CacheFileChecksumMap:
             self.latest_application_version = self.owner.header.application_version
 
     def serialize(self):
-        """Serialize checksum map with RSA signature."""
+        """Serialize checksum map with optional RSA signature and footer.
+
+        v6: Includes RSA signature + latest_application_version footer
+        v3/v5: Includes 128-byte null signature, no footer
+        v1: No checksum map at all
+        """
         # Build checksum data without signature
         data = [
             struct.pack("<6L", self.header_version, self.checksum_size,
@@ -2108,13 +2220,20 @@ class CacheFileChecksumMap:
         data += [struct.pack("<2L", *i) for i in self.entries]
         data.append(pack_dword_list(self.checksums))
 
-        # Generate RSA signature if not already set
-        if not self.signature:
-            checksum_data = b"".join(data)
-            self.signature = _rsa_pkcs1_sha1_sign(checksum_data)
+        # Generate RSA signature only for v6 (format_code 0x14893721)
+        if self.format_code == 0x14893721:
+            if not self.signature:
+                checksum_data = b"".join(data)
+                self.signature = _rsa_pkcs1_sha1_sign(checksum_data)
+            data.append(self.signature)
+            # v6 includes the latest_application_version footer
+            data.append(struct.pack("<L", self.latest_application_version))
+        else:
+            # v3/v5 use null signature, no footer
+            if not self.signature or len(self.signature) != 128:
+                self.signature = b"\0" * 128
+            data.append(self.signature)
 
-        data.append(self.signature)
-        data.append(struct.pack("<L", self.latest_application_version))
         return b"".join(data)
 
     def verify_signature(self) -> bool:
