@@ -261,6 +261,7 @@ class CacheFile:
             # Data Header.
             self.data_header = CacheFileSectorHeader(self)
             header_size = 24 if self.header.format_version > 3 else 20
+            pos = stream.tell()
             self.data_header.parse(stream.read(header_size), self.header.format_version)
             self.data_header.validate()
 
@@ -750,6 +751,7 @@ class CacheFile:
                     checksum_map = None  # Force regeneration
 
             if need_regen or checksum_map is None:
+
                 checksum_map = CacheFileChecksumMap(owner)
                 checksum_map.header_version = 1
                 # v6 uses magic format code, v3/v5 use simple format
@@ -847,6 +849,7 @@ class CacheFile:
         header.sector_size = self.header.sector_size
         data_header.sector_size = self.header.sector_size
 
+
         blocks_bytes = blocks.serialize()
         alloc_bytes = alloc_table.serialize()
         block_entry_bytes = (
@@ -862,14 +865,15 @@ class CacheFile:
         )
 
         header_size = 44
-        data_header.first_sector_offset = (
+        checksum_offset = (
             header_size
             + len(blocks_bytes)
             + len(alloc_bytes)
             + len(block_entry_bytes)
             + len(manifest_bytes)
-            + len(checksum_bytes)
         )
+
+        data_header.first_sector_offset = checksum_offset + len(checksum_bytes)
         data_header_bytes = data_header.serialize()
         # The offset stored in the data header points to the first data sector,
         # not the start of the header itself.  Account for the header size and
@@ -2031,6 +2035,10 @@ class CacheFileManifest:
         self.num_of_user_config_files = len(self.user_config_entries)
         self.num_of_minimum_footprint_files = len(self.minimum_footprint_entries)
         self.name_size = len(self.filename_table)
+
+        # Calculate binary_size: header + entries + name table + hash tables + footprint/config lists
+        # Note: map_header (map_header_version, map_dummy1) is written AFTER binary_size bytes
+        # and manifest_map_entries is also written after binary_size bytes
         self.binary_size = 56 + 32 * self.node_count + self.name_size + 4 * (
             self.hash_table_key_count
             + self.num_of_user_config_files
@@ -2182,6 +2190,7 @@ class CacheFileChecksumMap:
         self.checksums = []
 
     def parse(self, stream):
+        pos = stream.tell()
 
         (self.header_version,
          self.checksum_size,
@@ -2190,6 +2199,7 @@ class CacheFileChecksumMap:
          self.file_id_count,
          self.checksum_count) = struct.unpack("<6L", stream.read(24))
 
+
         for i in range(self.file_id_count):
             self.entries.append(struct.unpack("<2L", stream.read(8)))
 
@@ -2197,11 +2207,14 @@ class CacheFileChecksumMap:
 
         self.signature = stream.read(128)
 
-        # Read latest application version footer
-        try:
-            self.latest_application_version = struct.unpack("<L", stream.read(4))[0]
-        except Exception:
-            # Older formats might not have this field
+        # Read latest application version footer (only present in v6 with format_code 0x14893721)
+        if self.format_code == 0x14893721:
+            try:
+                self.latest_application_version = struct.unpack("<L", stream.read(4))[0]
+            except Exception:
+                self.latest_application_version = self.owner.header.application_version
+        else:
+            # v3/v5 don't have this footer
             self.latest_application_version = self.owner.header.application_version
 
     def serialize(self):
@@ -2211,6 +2224,7 @@ class CacheFileChecksumMap:
         v3/v5: Includes 128-byte null signature, no footer
         v1: No checksum map at all
         """
+
         # Build checksum data without signature
         data = [
             struct.pack("<6L", self.header_version, self.checksum_size,
@@ -2286,6 +2300,7 @@ class CacheFileSectorHeader:
                 self.sectors_used,
                 self.checksum,
             ) = struct.unpack("<6L", data)
+
 
     def serialize(self):
         self.checksum = self.calculate_checksum()
